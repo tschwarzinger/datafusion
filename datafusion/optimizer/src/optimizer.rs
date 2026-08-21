@@ -741,7 +741,7 @@ impl Optimizer {
                     last_changing_rule == Some(idx) && !transformed;
                 let is_last_rule = idx == self.rules.len() - 1;
                 if is_full_round_without_change && !is_last_rule {
-                    println!(
+                    debug!(
                         "One full iteration complete without any changes. Stoping optimization pass {i} early at rule '{}' (index: {idx}).",
                         rule.name()
                     );
