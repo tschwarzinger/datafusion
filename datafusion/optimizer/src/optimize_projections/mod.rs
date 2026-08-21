@@ -273,11 +273,23 @@ fn optimize_projections(
                 Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
                 None => indices.into_inner(),
             };
-            let new_scan = TableScanBuilder::from(table_scan)
-                .with_projection(Some(projection))
-                .build()?;
 
-            return Transformed::yes(LogicalPlan::TableScan(new_scan))
+            // Check if the projection actually changed
+            let projection_changed = match &table_scan.projection {
+                Some(old_projection) => old_projection != &projection,
+                None => projection != (0..projection.len()).collect::<Vec<_>>(),
+            };
+
+            let transformed_scan = if projection_changed {
+                let new_scan = TableScanBuilder::from(table_scan)
+                    .with_projection(Some(projection))
+                    .build()?;
+                Transformed::yes(LogicalPlan::TableScan(new_scan))
+            } else {
+                Transformed::no(LogicalPlan::TableScan(table_scan))
+            };
+
+            return transformed_scan
                 .transform_data(|plan| optimize_subqueries(plan, config));
         }
         // Other node types are handled below
@@ -842,7 +854,12 @@ fn rewrite_projection_given_requirements(
     config: &dyn OptimizerConfig,
     indices: &RequiredIndices,
 ) -> Result<Transformed<LogicalPlan>> {
-    let Projection { expr, input, .. } = proj;
+    let Projection {
+        expr,
+        input,
+        schema,
+        ..
+    } = proj;
 
     let exprs_used = indices.get_at_indices(&expr);
 
@@ -855,10 +872,14 @@ fn rewrite_projection_given_requirements(
         .transform_data(|input| {
             if is_projection_unnecessary(&input, &exprs_used)? {
                 Ok(Transformed::yes(input))
-            } else {
+            } else if exprs_used != expr {
                 Projection::try_new(exprs_used, Arc::new(input))
                     .map(LogicalPlan::Projection)
                     .map(Transformed::yes)
+            } else {
+                Projection::try_new_with_schema(exprs_used, Arc::new(input), schema)
+                    .map(LogicalPlan::Projection)
+                    .map(Transformed::no)
             }
         })
 }
