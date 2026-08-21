@@ -604,8 +604,6 @@ impl Optimizer {
         plan.check_invariants(InvariantLevel::Executable)
             .map_err(|e| e.context("Invalid input plan before LP Optimizers"))?;
 
-        let mut last_plan = plan.clone();
-
         let start_time = Instant::now();
         let options = config.options();
         let mut new_plan = plan;
@@ -617,9 +615,6 @@ impl Optimizer {
 
         let mut i = 0;
         let mut last_changing_rule = None;
-        let mut last_change_transaformed = String::new();
-        let mut last_change_plan = String::new();
-
         while i < options.optimizer.max_passes {
             log_plan(&format!("Optimizer input (pass {i})"), &new_plan);
 
@@ -733,8 +728,6 @@ impl Optimizer {
 
                 if transformed {
                     has_subqueries = plan_has_subqueries(&new_plan);
-                    last_change_transaformed =
-                        format!("{} (pass {}, index: {idx})", rule.name(), i);
                     log_plan(rule.name(), &new_plan);
                 } else {
                     debug!(
@@ -743,12 +736,6 @@ impl Optimizer {
                         i
                     );
                 }
-
-                if last_plan != new_plan {
-                    last_change_plan =
-                        format!("{} (pass {}, index: {idx})", rule.name(), i);
-                }
-                last_plan = new_plan.clone();
 
                 let is_full_round_without_change =
                     last_changing_rule == Some(idx) && !transformed;
@@ -778,9 +765,6 @@ impl Optimizer {
             }
             i += 1;
         }
-        println!("\n");
-        println!("Last pass {}: {}", i, last_change_transaformed);
-        println!("Last pass {}: {}", i, last_change_plan);
 
         // verify that the optimizer passes only mutated what was permitted.
         assert_valid_optimization(&new_plan, &starting_schema).map_err(|e| {
