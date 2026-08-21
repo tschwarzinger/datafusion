@@ -614,6 +614,7 @@ impl Optimizer {
         let starting_schema = Arc::clone(new_plan.schema());
 
         let mut i = 0;
+        let mut last_changing_rule = None;
         while i < options.optimizer.max_passes {
             log_plan(&format!("Optimizer input (pass {i})"), &new_plan);
 
@@ -623,7 +624,7 @@ impl Optimizer {
             // change.
             let mut has_subqueries = plan_has_subqueries(&new_plan);
 
-            for rule in &self.rules {
+            for (idx, rule) in self.rules.iter().enumerate() {
                 // If skipping failed rules, copy plan before attempting to rewrite
                 // as rewriting is destructive
                 let prev_plan = options
@@ -690,7 +691,7 @@ impl Optimizer {
                 });
 
                 // Handle results
-                match (result, prev_plan) {
+                let transformed = match (result, prev_plan) {
                     // OptimizerRule was successful
                     (
                         Ok(Transformed {
@@ -700,16 +701,7 @@ impl Optimizer {
                     ) => {
                         new_plan = data;
                         observer(&new_plan, rule.as_ref());
-                        if transformed {
-                            has_subqueries = plan_has_subqueries(&new_plan);
-                            log_plan(rule.name(), &new_plan);
-                        } else {
-                            debug!(
-                                "Plan unchanged by optimizer rule '{}' (pass {})",
-                                rule.name(),
-                                i
-                            );
-                        }
+                        transformed
                     }
                     // OptimizerRule was unsuccessful, but skipped failed rules is on
                     // so use the previous plan
@@ -723,6 +715,7 @@ impl Optimizer {
                             e
                         );
                         new_plan = orig_plan;
+                        false
                     }
                     // OptimizerRule was unsuccessful, but skipped failed rules is off, return error
                     (Err(e), None) => {
@@ -731,7 +724,27 @@ impl Optimizer {
                             rule.name()
                         )));
                     }
+                };
+
+                if transformed {
+                    has_subqueries = plan_has_subqueries(&new_plan);
+                    log_plan(rule.name(), &new_plan);
+                } else {
+                    debug!(
+                        "Plan unchanged by optimizer rule '{}' (pass {})",
+                        rule.name(),
+                        i
+                    );
                 }
+
+                if last_changing_rule == Some(idx) {
+                    break;
+                }
+                last_changing_rule = if transformed {
+                    Some(idx)
+                } else {
+                    last_changing_rule
+                };
             }
             log_plan(&format!("Optimized plan (pass {i})"), &new_plan);
 
