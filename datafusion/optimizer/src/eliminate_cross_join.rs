@@ -20,6 +20,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
 use crate::join_key_set::JoinKeySet;
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{NullEquality, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
@@ -77,6 +78,12 @@ impl EliminateCrossJoin {
 impl OptimizerRule for EliminateCrossJoin {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites `LogicalPlan::Join` nodes (matching its
+        // own `plan_has_joins` fast pre-check).
+        sketch.sketch(plan).has_node(NodeKind::Join)
     }
 
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]

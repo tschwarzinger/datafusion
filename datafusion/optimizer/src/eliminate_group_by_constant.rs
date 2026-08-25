@@ -17,6 +17,7 @@
 
 //! [`EliminateGroupByConstant`] removes constant and functionally redundant
 //! expressions from `GROUP BY` clause
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -41,6 +42,11 @@ impl EliminateGroupByConstant {
 impl OptimizerRule for EliminateGroupByConstant {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites `LogicalPlan::Aggregate` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Aggregate)
     }
 
     fn rewrite(

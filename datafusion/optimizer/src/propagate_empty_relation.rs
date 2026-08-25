@@ -25,6 +25,7 @@ use datafusion_common::{Column, DFSchemaRef, Result, ScalarValue, plan_err};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{EmptyRelation, Expr, GroupingSet, Projection, Union, cast, lit};
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -42,6 +43,12 @@ impl PropagateEmptyRelation {
 impl OptimizerRule for PropagateEmptyRelation {
     fn name(&self) -> &str {
         "propagate_empty_relation"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule propagates emptiness up from child `EmptyRelation` nodes;
+        // with none present it cannot change anything.
+        sketch.sketch(plan).has_node(NodeKind::EmptyRelation)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

@@ -22,6 +22,7 @@ use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{EmptyRelation, Expr, Filter, LogicalPlan};
 use std::sync::Arc;
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -43,6 +44,11 @@ impl EliminateFilter {
 impl OptimizerRule for EliminateFilter {
     fn name(&self) -> &str {
         "eliminate_filter"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only removes `LogicalPlan::Filter` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Filter)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

@@ -18,6 +18,7 @@
 //! Rewrites `UNION DISTINCT` branches that differ only by filter predicates
 //! into a single filtered branch plus `DISTINCT`.
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
@@ -43,6 +44,13 @@ impl UnionsToFilter {
 impl OptimizerRule for UnionsToFilter {
     fn name(&self) -> &str {
         "unions_to_filter"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // The rewriter only fires on `Distinct(Distinct::All(Union))`; without a
+        // `Distinct` node anywhere it cannot change the plan. This mirrors its
+        // own `plan.exists(...)` fast pre-check.
+        sketch.sketch(plan).has_node(NodeKind::Distinct)
     }
 
     fn supports_rewrite(&self) -> bool {

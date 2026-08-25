@@ -18,6 +18,7 @@
 //! [`EliminateOuterJoin`] rewrites outer joins to simpler join types when
 //! filters make the outer rows unnecessary (e.g. `LEFT`/`RIGHT` to `INNER`,
 //! and `FULL` to `LEFT`/`RIGHT`/`INNER`).
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::push_down_filter::replace_cols_by_name;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::{Column, DFSchema, Result, qualified_name};
@@ -89,6 +90,14 @@ impl EliminateOuterJoin {
 impl OptimizerRule for EliminateOuterJoin {
     fn name(&self) -> &str {
         "eliminate_outer_join"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule rewrites a `Filter` sitting above an *outer* join; it can
+        // only fire when both are present.
+        const OUTER: &[JoinType] = &[JoinType::Left, JoinType::Right, JoinType::Full];
+        let s = sketch.sketch(plan);
+        s.has_node(NodeKind::Filter) && s.has_any_join_type(OUTER)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

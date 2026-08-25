@@ -21,6 +21,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::decorrelate::PullUpCorrelatedExpr;
+use crate::logical_plan_sketch::{ExprKind, LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::utils::replace_qualified_name;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -56,6 +57,14 @@ impl DecorrelatePredicateSubquery {
 impl OptimizerRule for DecorrelatePredicateSubquery {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only rewrites a `Filter` whose predicate contains an
+        // `IN`/`EXISTS` subquery (see `has_subquery`).
+        let s = sketch.sketch(plan);
+        s.has_node(NodeKind::Filter)
+            && (s.has_expr(ExprKind::InSubquery) || s.has_expr(ExprKind::Exists))
     }
 
     fn rewrite(

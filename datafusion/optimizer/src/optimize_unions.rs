@@ -16,6 +16,7 @@
 // under the License.
 
 //! [`OptimizeUnions`]: removes `Union` nodes in the logical plan.
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
@@ -41,6 +42,11 @@ impl OptimizeUnions {
 impl OptimizerRule for OptimizeUnions {
     fn name(&self) -> &str {
         "optimize_unions"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // Every rewrite in this rule involves a `LogicalPlan::Union` node.
+        sketch.sketch(plan).has_node(NodeKind::Union)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

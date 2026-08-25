@@ -16,6 +16,7 @@
 // under the License.
 
 //! [`EliminateLimit`] eliminates `LIMIT` when possible
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
@@ -43,6 +44,11 @@ impl EliminateLimit {
 impl OptimizerRule for EliminateLimit {
     fn name(&self) -> &str {
         "eliminate_limit"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only rewrites `LogicalPlan::Limit` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Limit)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

@@ -21,6 +21,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::logical_plan_sketch::{ExprKind, LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::utils::{evaluates_to_null, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -86,6 +87,13 @@ impl ScalarSubqueryToJoin {
 impl OptimizerRule for ScalarSubqueryToJoin {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites a `Filter` that contains a scalar
+        // subquery expression.
+        let s = sketch.sketch(plan);
+        s.has_node(NodeKind::Filter) && s.has_expr(ExprKind::ScalarSubquery)
     }
 
     fn rewrite(

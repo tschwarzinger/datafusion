@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -107,6 +108,11 @@ fn contains_grouping_set(expr: &[Expr]) -> bool {
 impl OptimizerRule for SingleDistinctToGroupBy {
     fn name(&self) -> &str {
         "single_distinct_aggregation_to_group_by"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only rewrites `LogicalPlan::Aggregate` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Aggregate)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

@@ -45,6 +45,7 @@ use datafusion_expr::{
 };
 
 use crate::optimizer::ApplyOrder;
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::simplify_expressions::{reorder_predicates, simplify_predicates};
 use crate::utils::{
     ColumnReference, has_all_column_refs, is_restrict_null_predicate, schema_columns,
@@ -780,6 +781,13 @@ impl OptimizerRule for PushDownFilter {
 
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule either pushes down a `Filter` or evaluates a `Join`;
+        // without either node present it cannot change the plan.
+        let s = sketch.sketch(plan);
+        s.has_node(NodeKind::Filter) || s.has_node(NodeKind::Join)
     }
 
     fn rewrite(

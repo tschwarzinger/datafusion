@@ -20,6 +20,7 @@
 use std::cmp::min;
 use std::sync::Arc;
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -45,6 +46,12 @@ impl PushDownLimit {
 impl OptimizerRule for PushDownLimit {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // PushDownLimit only moves existing `LogicalPlan::Limit` nodes down;
+        // with no Limit present there is nothing to push.
+        sketch.sketch(plan).has_node(NodeKind::Limit)
     }
 
     #[expect(clippy::only_used_in_recursion)]

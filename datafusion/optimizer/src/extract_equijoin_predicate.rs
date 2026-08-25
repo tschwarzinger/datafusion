@@ -16,6 +16,7 @@
 // under the License.
 
 //! [`ExtractEquijoinPredicate`] identifies equality join (equijoin) predicates
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::tree_node::Transformed;
@@ -51,6 +52,11 @@ impl ExtractEquijoinPredicate {
 impl OptimizerRule for ExtractEquijoinPredicate {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites `LogicalPlan::Join` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Join)
     }
 
     fn name(&self) -> &str {

@@ -71,6 +71,7 @@
 //! duplicate-sensitivity (projection, aggregate, sort, ...) adjust it first.
 use crate::utils::for_each_referenced_index;
 use crate::{OptimizerConfig, OptimizerRule};
+use crate::logical_plan_sketch::LazyLogicalPlanSketch;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     DFSchema, Dependency, HashSet, NullEquality, Result, ScalarValue,
@@ -171,6 +172,17 @@ impl EliminateJoin {
 impl OptimizerRule for EliminateJoin {
     fn name(&self) -> &str {
         "eliminate_join"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // `EliminateJoin` only ever rewrites `Inner` (to semi / empty) and
+        // removes `Left`/`Right` outer joins. `Semi`/`Anti`/`Mark`/`Full` joins
+        // are always threaded through unchanged. If none of the rewritable
+        // join types is present anywhere (including inside subqueries, which
+        // the sketch recurses into), the rule is guaranteed not to change the
+        // plan and can be skipped.
+        const REWRITABLE: &[JoinType] = &[JoinType::Inner, JoinType::Left, JoinType::Right];
+        sketch.sketch(plan).has_any_join_type(REWRITABLE)
     }
 
     fn rewrite(

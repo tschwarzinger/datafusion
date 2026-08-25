@@ -54,6 +54,7 @@ use crate::eliminate_outer_join::EliminateOuterJoin;
 use crate::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use crate::extract_leaf_expressions::{ExtractLeafExpressions, PushDownLeafProjections};
 use crate::filter_null_join_keys::FilterNullJoinKeys;
+use crate::logical_plan_sketch::LazyLogicalPlanSketch;
 use crate::optimize_projections::OptimizeProjections;
 use crate::optimize_unions::OptimizeUnions;
 use crate::plan_signature::LogicalPlanSignature;
@@ -95,6 +96,23 @@ pub trait OptimizerRule: Debug {
     /// Does this rule support rewriting owned plans (rather than by reference)?
     #[deprecated(since = "47.0.0", note = "This method is no longer used")]
     fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    /// Return `false` if `rewrite` is guaranteed to leave `plan` unchanged,
+    /// allowing the optimizer to skip applying the rule entirely.
+    ///
+    /// Implementations may consult the lazily-computed
+    /// [`crate::logical_plan_sketch::LogicalPlanSketch`] to cheaply "rule
+    /// themselves out" (for example, `EliminateJoin` returns `false` when the
+    /// plan contains no rewritable join). Returning `true` (the default) always
+    /// runs the rule, preserving the historical behavior.
+    ///
+    /// This must be *conservative*: it must return `true` whenever the rule
+    /// could possibly change the plan. If it erroneously returns `false` when
+    /// the rule could have changed the plan, the resulting plan would be
+    /// incorrect.
+    fn may_change_plan(&self, _plan: &LogicalPlan, _sketch: &mut LazyLogicalPlanSketch) -> bool {
         true
     }
 
@@ -623,7 +641,23 @@ impl Optimizer {
             // change.
             let mut has_subqueries = plan_has_subqueries(&new_plan);
 
+            // Lazily-computed sketch of the current plan, shared across the
+            // rules of this pass. It is invalidated whenever a rule changes the
+            // plan so the next rule that consults it sees the fresh state.
+            let mut sketch = LazyLogicalPlanSketch::new();
+
             for rule in &self.rules {
+                // If this rule is guaranteed not to change the plan, skip it
+                // entirely (cheaply determined via the sketch).
+                if !rule.may_change_plan(&new_plan, &mut sketch) {
+                    debug!(
+                        "Skipping optimizer rule '{}' (pass {}) because the plan cannot change",
+                        rule.name(),
+                        i
+                    );
+                    continue;
+                }
+
                 // If skipping failed rules, copy plan before attempting to rewrite
                 // as rewriting is destructive
                 let prev_plan = options
@@ -633,6 +667,7 @@ impl Optimizer {
 
                 let starting_schema = Arc::clone(new_plan.schema());
 
+                let rule_start = Instant::now();
                 let result = match rule.apply_order() {
                     // optimizer handles recursion
                     Some(apply_order) => {
@@ -700,8 +735,16 @@ impl Optimizer {
                     ) => {
                         new_plan = data;
                         observer(&new_plan, rule.as_ref());
+                        eprintln!(
+                            "optimizer rule: name={} pass={} changed={} duration_us={}",
+                            rule.name(),
+                            i,
+                            transformed,
+                            rule_start.elapsed().as_micros()
+                        );
                         if transformed {
                             has_subqueries = plan_has_subqueries(&new_plan);
+                            sketch.invalidate();
                             log_plan(rule.name(), &new_plan);
                         } else {
                             debug!(

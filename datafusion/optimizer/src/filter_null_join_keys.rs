@@ -17,6 +17,7 @@
 
 //! [`FilterNullJoinKeys`] adds filters to join inputs when input isn't nullable
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::push_down_filter::on_lr_is_preserved;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -35,6 +36,11 @@ pub struct FilterNullJoinKeys {}
 impl OptimizerRule for FilterNullJoinKeys {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites `LogicalPlan::Join` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Join)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

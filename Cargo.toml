@@ -394,6 +394,7 @@ strip = false        # Retain debug info for flamegraphs
 inherits = "release"
 debug = true
 strip = false
+lto = false
 
 [profile.ci-optimized]
 inherits = "release"

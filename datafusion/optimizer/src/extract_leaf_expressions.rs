@@ -30,6 +30,7 @@ use datafusion_common::{Column, DFSchema, Result, qualified_name};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, ExpressionPlacement, Projection};
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::push_down_filter::replace_cols_by_name;
 use crate::utils::{ColumnReference, has_all_column_refs, schema_columns};
@@ -112,6 +113,20 @@ impl ExtractLeafExpressions {
 impl OptimizerRule for ExtractLeafExpressions {
     fn name(&self) -> &str {
         "extract_leaf_expressions"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // `extract_from_plan` only ever rewrites Aggregate/Filter/Sort/Limit/Join
+        // nodes (it returns `no` for every other plan type).
+        const TRIGGERS: [NodeKind; 5] = [
+            NodeKind::Aggregate,
+            NodeKind::Filter,
+            NodeKind::Sort,
+            NodeKind::Limit,
+            NodeKind::Join,
+        ];
+        let s = sketch.sketch(plan);
+        TRIGGERS.iter().any(|k| s.has_node(*k))
     }
 
     fn rewrite(
@@ -721,6 +736,12 @@ impl PushDownLeafProjections {
 impl OptimizerRule for PushDownLeafProjections {
     fn name(&self) -> &str {
         "push_down_leaf_projections"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // `try_push_input` only fires on a `Projection` node; with no Projection
+        // present it cannot change the plan.
+        sketch.sketch(plan).has_node(NodeKind::Projection)
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {

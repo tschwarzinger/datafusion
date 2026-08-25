@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::ApplyOrder;
 use crate::utils::evaluates_to_null;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -47,6 +48,11 @@ impl DecorrelateLateralJoin {
 impl OptimizerRule for DecorrelateLateralJoin {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only ever rewrites a `Join` node (an apply operator).
+        sketch.sketch(plan).has_node(NodeKind::Join)
     }
 
     fn rewrite(

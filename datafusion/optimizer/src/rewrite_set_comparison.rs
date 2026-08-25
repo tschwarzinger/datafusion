@@ -19,6 +19,7 @@
 //! `> ALL`) into boolean expressions built from `EXISTS` subqueries
 //! that capture SQL three-valued logic.
 
+use crate::logical_plan_sketch::{ExprKind, LazyLogicalPlanSketch};
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
@@ -66,6 +67,12 @@ impl RewriteSetComparison {
 impl OptimizerRule for RewriteSetComparison {
     fn name(&self) -> &str {
         "rewrite_set_comparison"
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only rewrites `Expr::SetComparison` subqueries; if none is
+        // present in the whole plan (including subqueries), it cannot change it.
+        sketch.sketch(plan).has_expr(ExprKind::SetComparison)
     }
 
     fn rewrite(

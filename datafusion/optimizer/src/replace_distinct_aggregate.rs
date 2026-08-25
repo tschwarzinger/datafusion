@@ -17,6 +17,7 @@
 
 //! [`ReplaceDistinctWithAggregate`] replaces `DISTINCT ...` with `GROUP BY ...`
 
+use crate::logical_plan_sketch::{LazyLogicalPlanSketch, NodeKind};
 use crate::optimizer::{ApplyOrder, ApplyOrder::BottomUp};
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -78,6 +79,11 @@ impl ReplaceDistinctWithAggregate {
 impl OptimizerRule for ReplaceDistinctWithAggregate {
     fn supports_rewrite(&self) -> bool {
         true
+    }
+
+    fn may_change_plan(&self, plan: &LogicalPlan, sketch: &mut LazyLogicalPlanSketch) -> bool {
+        // This rule only rewrites `LogicalPlan::Distinct` nodes.
+        sketch.sketch(plan).has_node(NodeKind::Distinct)
     }
 
     fn rewrite(
