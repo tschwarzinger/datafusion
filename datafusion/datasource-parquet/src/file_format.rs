@@ -60,14 +60,25 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
 use crate::metadata::{DFParquetMetadata, lex_ordering_to_sorting_columns};
+use crate::opener::build_pruning_predicates;
 use crate::reader::CachedParquetFileReaderFactory;
 use crate::source::{
     ParquetSource, parse_coerce_int96_string, parse_coerce_int96_tz_string,
 };
+use crate::{
+    PagePruningAccessPlanFilter, ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess,
+    RowGroupAccessPlanFilter,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion_common::stats::Precision;
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::{FileRange, compute_all_files_statistics};
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_physical_expr_common::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_plan::metrics::Count;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -75,6 +86,13 @@ use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::async_reader::MetadataFetch;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
+
+/// Result of eager pruning containing the access plan and estimated statistics (including bytes to scan).
+#[derive(Debug, Clone)]
+pub struct EagerPruningResult {
+    pub access_plan: ParquetAccessPlan,
+    pub statistics: Statistics,
+}
 
 #[derive(Default)]
 /// Factory struct used to create [ParquetFormat]
@@ -256,6 +274,116 @@ impl ParquetFormat {
     pub fn with_coerce_int96(mut self, time_unit: Option<String>) -> Self {
         self.options.global.coerce_int96 = time_unit;
         self
+    }
+
+    /// Evaluates eager pruning logic to construct a `ParquetAccessPlan` and statistics (including bytes to scan).
+    pub fn compute_eager_pruning(
+        &self,
+        parquet_meta: &ParquetMetaData,
+        object_meta: &ObjectMeta,
+        file_range: Option<&FileRange>,
+        file_schema: &SchemaRef,
+        table_schema: &SchemaRef,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Result<EagerPruningResult> {
+        let num_row_groups = parquet_meta.num_row_groups();
+        let access_plan = ParquetAccessPlan::new_all(num_row_groups);
+        let mut rg_filter = RowGroupAccessPlanFilter::new(access_plan);
+
+        if let Some(range) = file_range {
+            rg_filter.prune_by_range(parquet_meta.row_groups(), range);
+        }
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics =
+            ParquetFileMetrics::new(0, object_meta.location.as_ref(), &metrics_set);
+
+        if let Some(predicate) = predicate {
+            let predicate_creation_errors = Count::new();
+            if let Some(pruning_predicate) = build_pruning_predicates(
+                Some(predicate),
+                file_schema,
+                &predicate_creation_errors,
+                datafusion_pruning::MAX_IN_LIST_SIZE,
+            ) {
+                rg_filter.prune_by_statistics_with_metadata(
+                    file_schema.as_ref(),
+                    parquet_meta,
+                    &pruning_predicate,
+                    &metrics,
+                );
+            }
+        }
+
+        let mut access_plan = rg_filter.build();
+
+        // Page Index Pruning
+        if self.options.global.enable_page_index
+            && let Some(predicate) = predicate
+        {
+            let page_filter =
+                PagePruningAccessPlanFilter::new(predicate, Arc::clone(file_schema));
+            access_plan = page_filter.prune_plan_with_page_index(
+                access_plan,
+                file_schema.as_ref(),
+                parquet_meta.file_metadata().schema_descr(),
+                parquet_meta,
+                &metrics,
+            );
+        }
+
+        // Determine matching rows and necessary bytes to scan.
+        let mut row_count = 0;
+        let mut total_byte_size = 0;
+        let mut has_matching_row_group = false;
+
+        for (i, rg) in parquet_meta.row_groups().iter().enumerate() {
+            match &access_plan.inner()[i] {
+                RowGroupAccess::Skip => {}
+                RowGroupAccess::Scan => {
+                    if rg.num_rows() > 0 {
+                        row_count += rg.num_rows() as usize;
+                        total_byte_size +=
+                            u64::try_from(rg.compressed_size()).unwrap_or(0) as usize;
+                        has_matching_row_group = true;
+                    }
+                }
+                RowGroupAccess::Selection(selection) => {
+                    let count = selection.row_count();
+                    if count > 0 {
+                        row_count += count;
+                        let rg_rows = (rg.num_rows() as usize).max(1);
+                        let rg_bytes =
+                            u64::try_from(rg.compressed_size()).unwrap_or(0) as usize;
+                        let estimated_bytes =
+                            (rg_bytes as f64 * (count as f64 / rg_rows as f64)) as usize;
+                        total_byte_size += estimated_bytes;
+                        has_matching_row_group = true;
+                    }
+                }
+            }
+        }
+
+        // println!("{} KiB", total_byte_size / 1024);
+
+        let statistics = if has_matching_row_group {
+            Statistics {
+                num_rows: Precision::Inexact(row_count),
+                total_byte_size: Precision::Inexact(total_byte_size),
+                column_statistics: Statistics::unknown_column(table_schema),
+            }
+        } else {
+            Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: Precision::Exact(0),
+                column_statistics: Statistics::unknown_column(table_schema),
+            }
+        };
+
+        Ok(EagerPruningResult {
+            access_plan,
+            statistics,
+        })
     }
 }
 
@@ -514,13 +642,14 @@ impl FileFormat for ParquetFormat {
             .ok_or_else(|| internal_datafusion_err!("Expected ParquetSource"))?;
         source = source.with_table_parquet_options(self.options.clone());
 
-        // Use the CachedParquetFileReaderFactory
-        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
         let store = state
             .runtime_env()
             .object_store(conf.object_store_url.clone())?;
-        let cached_parquet_read_factory =
-            Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
+        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+        let cached_parquet_read_factory = Arc::new(CachedParquetFileReaderFactory::new(
+            Arc::clone(&store),
+            Arc::clone(&metadata_cache),
+        ));
         source = source.with_parquet_file_reader_factory(cached_parquet_read_factory);
 
         if let Some(metadata_size_hint) = metadata_size_hint {
@@ -529,9 +658,55 @@ impl FileFormat for ParquetFormat {
 
         source = self.set_source_encryption_factory(source, state)?;
 
+        let mut new_file_groups = Vec::with_capacity(conf.file_groups.len());
+        for file_group in &conf.file_groups {
+            let mut new_files = Vec::with_capacity(file_group.len());
+            for file in file_group.iter() {
+                let mut file = file.clone();
+                let file_decryption_properties = get_file_decryption_properties(
+                    state,
+                    &self.options,
+                    &file.object_meta.location,
+                )
+                .await?;
+
+                let parquet_meta =
+                    DFParquetMetadata::new(store.as_ref(), &file.object_meta)
+                        .with_metadata_size_hint(self.metadata_size_hint())
+                        .with_decryption_properties(file_decryption_properties)
+                        .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
+                        .fetch_metadata()
+                        .await?;
+
+                let pruning_res = self.compute_eager_pruning(
+                    &parquet_meta,
+                    &file.object_meta,
+                    file.range.as_ref(),
+                    source.table_schema.file_schema(),
+                    source.table_schema.table_schema(),
+                    source.predicate.as_ref(),
+                )?;
+
+                file.extensions.insert(pruning_res.access_plan);
+                file.statistics = Some(Arc::new(pruning_res.statistics));
+                new_files.push(file);
+            }
+            new_file_groups.push(FileGroup::new(new_files));
+        }
+
+        let (new_file_groups, overall_statistics) = compute_all_files_statistics(
+            new_file_groups,
+            Arc::clone(source.table_schema.table_schema()),
+            true,
+            false,
+        )?;
+
         let conf = FileScanConfigBuilder::from(conf)
             .with_source(Arc::new(source))
+            .with_file_groups(new_file_groups)
+            .with_statistics(overall_statistics)
             .build();
+
         Ok(DataSourceExec::from_data_source(conf))
     }
 
@@ -826,5 +1001,161 @@ impl From<&ParquetFormatFactory> for protobuf::TableParquetOptions {
             })
             .collect(),
     }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::ToDFSchema;
+    use datafusion_common::stats::Precision;
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_expr::{col, lit};
+    use datafusion_physical_expr::create_physical_expr;
+    use datafusion_physical_expr::execution_props::ExecutionProps;
+    use parquet::basic::Type as PhysicalType;
+    use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
+    use parquet::file::statistics::Statistics as ParquetStatistics;
+    use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor, Type as SchemaType};
+
+    fn create_test_schema() -> (SchemaRef, SchemaDescPtr) {
+        let arrow_schema =
+            Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+        let field = SchemaType::primitive_type_builder("c1", PhysicalType::INT32)
+            .build()
+            .unwrap();
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![Arc::new(field)])
+            .build()
+            .unwrap();
+        let schema_descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+        (arrow_schema, schema_descr)
+    }
+
+    #[test]
+    fn test_compute_eager_pruning() {
+        let (schema, schema_descr) = create_test_schema();
+
+        // RG 1: min=1, max=10, 100 rows, 1000 compressed bytes
+        let col1 = ColumnChunkMetaData::builder(schema_descr.column(0))
+            .set_statistics(ParquetStatistics::int32(
+                Some(1),
+                Some(10),
+                None,
+                Some(0),
+                false,
+            ))
+            .set_num_values(100)
+            .set_total_compressed_size(1000)
+            .set_total_uncompressed_size(1000)
+            .build()
+            .unwrap();
+        let rg1 = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(100)
+            .set_total_byte_size(1000)
+            .set_column_metadata(vec![col1])
+            .build()
+            .unwrap();
+
+        // RG 2: min=20, max=30, 200 rows, 2000 compressed bytes
+        let col2 = ColumnChunkMetaData::builder(schema_descr.column(0))
+            .set_statistics(ParquetStatistics::int32(
+                Some(20),
+                Some(30),
+                None,
+                Some(0),
+                false,
+            ))
+            .set_num_values(200)
+            .set_total_compressed_size(2000)
+            .set_total_uncompressed_size(2000)
+            .build()
+            .unwrap();
+        let rg2 = RowGroupMetaData::builder(schema_descr.clone())
+            .set_num_rows(200)
+            .set_total_byte_size(2000)
+            .set_column_metadata(vec![col2])
+            .build()
+            .unwrap();
+
+        let file_meta = FileMetaData::new(1, 300, None, None, schema_descr, None);
+        let parquet_meta = ParquetMetaData::new(file_meta, vec![rg1, rg2]);
+        let object_meta = ObjectMeta {
+            location: Path::from("test.parquet"),
+            last_modified: chrono::Utc::now(),
+            size: 3000,
+            e_tag: None,
+            version: None,
+        };
+
+        let format = ParquetFormat::default();
+        let df_schema = schema.clone().to_dfschema().unwrap();
+        let expr = col("c1").gt(lit(15));
+        let phys_expr = create_physical_expr(
+            &expr,
+            &df_schema,
+            &ExecutionProps::new(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        // Prune with c1 > 15: RG 1 (1..10) is pruned, RG 2 (20..30) is scanned
+        let res = format
+            .compute_eager_pruning(
+                &parquet_meta,
+                &object_meta,
+                None,
+                &schema,
+                &schema,
+                Some(&phys_expr),
+            )
+            .unwrap();
+
+        assert_eq!(
+            res.access_plan.inner(),
+            &[RowGroupAccess::Skip, RowGroupAccess::Scan]
+        );
+        assert_eq!(res.statistics.num_rows, Precision::Inexact(200));
+        assert_eq!(res.statistics.total_byte_size, Precision::Inexact(2000));
+
+        // Prune with c1 > 100: both pruned
+        let expr_none = col("c1").gt(lit(100));
+        let phys_expr_none = create_physical_expr(
+            &expr_none,
+            &df_schema,
+            &ExecutionProps::new(),
+            &Default::default(),
+        )
+        .unwrap();
+        let res_none = format
+            .compute_eager_pruning(
+                &parquet_meta,
+                &object_meta,
+                None,
+                &schema,
+                &schema,
+                Some(&phys_expr_none),
+            )
+            .unwrap();
+
+        assert_eq!(
+            res_none.access_plan.inner(),
+            &[RowGroupAccess::Skip, RowGroupAccess::Skip]
+        );
+        assert_eq!(res_none.statistics.num_rows, Precision::Exact(0));
+        assert_eq!(res_none.statistics.total_byte_size, Precision::Exact(0));
+
+        // Test FileGroup statistics computation
+        let mut file = PartitionedFile::new("test.parquet", 3000);
+        file.statistics = Some(Arc::new(res.statistics));
+        let file_group = FileGroup::new(vec![file]);
+        let (groups, overall) =
+            compute_all_files_statistics(vec![file_group], schema, true, false).unwrap();
+        let group_stats = groups[0].file_statistics(None).unwrap();
+        assert_eq!(group_stats.num_rows, Precision::Inexact(200));
+        assert_eq!(group_stats.total_byte_size, Precision::Inexact(2000));
+        assert_eq!(overall.num_rows, Precision::Inexact(200));
+        assert_eq!(overall.total_byte_size, Precision::Inexact(2000));
     }
 }
