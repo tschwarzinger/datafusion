@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -106,6 +106,10 @@ pub(crate) const HASH_JOIN_SEED: SeededRandomState =
     SeededRandomState::with_seed(12210250226015887276);
 
 const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
+
+/// Derived dynamic filters, as `(left_filters, right_filters)`, produced by
+/// transitive pushdown across equi-join keys.
+type DerivedDynamicFilters = (Vec<Arc<dyn PhysicalExpr>>, Vec<Arc<dyn PhysicalExpr>>);
 
 #[expect(clippy::too_many_arguments)]
 fn try_create_array_map(
@@ -1313,6 +1317,108 @@ impl HashJoinExec {
             reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
         }
     }
+
+    /// Derives transitive dynamic filters across equi-join keys.
+    ///
+    /// A [`DynamicFilterPhysicalExpr`] targeting a join key on one side of an
+    /// equi-join also constrains the matching key on the opposite side: every
+    /// row a join emits has equal keys, so `l_order_key IN (SET)` implies
+    /// `r_order_key IN (SET)` in the same joined row. This lets an inner (or
+    /// semi) join that receives a dynamic filter for its build key produce a
+    /// derived filter that prunes the probe side (or vice versa), without the
+    /// scan needing to wait for the rows to be produced.
+    ///
+    /// The derived filter is constructed with [`PhysicalExpr::with_new_children`],
+    /// so it shares the underlying producer state and `expression_id` of the
+    /// source filter: when the producer publishes the values all derived
+    /// filters are updated automatically.
+    ///
+    /// Returns the derived filters as `(left_filters, right_filters)` that
+    /// should be appended to the self filters pushed down to the respective
+    /// child.
+    fn transitive_dynamic_filters(
+        &self,
+        parent_filters: &[Arc<dyn PhysicalExpr>],
+        column_indices: &[ColumnIndex],
+    ) -> Result<DerivedDynamicFilters> {
+        // Only join types where every emitted row has equal keys on both sides
+        // can safely remap a filter onto the opposite child. Outer / anti joins
+        // emit rows whose keys do not match, so a filter for one side cannot be
+        // derived for the other.
+        if !matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
+        ) {
+            return Ok((vec![], vec![]));
+        }
+
+        // Build disjoint key maps: index (in the child schema) of a join key on
+        // one side -> the matching key column on the opposite side.
+        let mut left_to_right: HashMap<usize, Arc<dyn PhysicalExpr>> = HashMap::new();
+        let mut right_to_left: HashMap<usize, Arc<dyn PhysicalExpr>> = HashMap::new();
+        for (left_expr, right_expr) in &self.on {
+            if let Some(left_col) = left_expr.downcast_ref::<Column>() {
+                left_to_right.insert(left_col.index(), Arc::clone(right_expr));
+            }
+            if let Some(right_col) = right_expr.downcast_ref::<Column>() {
+                right_to_left.insert(right_col.index(), Arc::clone(left_expr));
+            }
+        }
+
+        let mut left_filters = vec![];
+        let mut right_filters = vec![];
+        'filters: for filter in parent_filters {
+            let Some(dynamic_filter) = filter.downcast_ref::<DynamicFilterPhysicalExpr>()
+            else {
+                continue;
+            };
+
+            // For each of the filter's target columns, determine the join key it
+            // matches and the column we must replace it with to target the
+            // opposite child. Every column must map cleanly, and they must all
+            // map to the *same* target side (a single derived filter can only be
+            // pushed to one child).
+            let mut replacements = Vec::with_capacity(dynamic_filter.children().len());
+            let mut target_side: Option<JoinSide> = None;
+            for child in dynamic_filter.children() {
+                let Some(col) = child.downcast_ref::<Column>() else {
+                    continue 'filters;
+                };
+                let Some(ci) = column_indices.get(col.index()) else {
+                    continue 'filters;
+                };
+                let (replacement, replacement_side) = match ci.side {
+                    JoinSide::Left => (left_to_right.get(&ci.index), JoinSide::Right),
+                    JoinSide::Right => (right_to_left.get(&ci.index), JoinSide::Left),
+                    JoinSide::None => continue 'filters,
+                };
+                let Some(replacement) = replacement else {
+                    continue 'filters;
+                };
+                if let Some(previous) = target_side {
+                    if previous != replacement_side {
+                        // Mixed targets: cannot express as a single derived filter.
+                        continue 'filters;
+                    }
+                } else {
+                    target_side = Some(replacement_side);
+                }
+                replacements.push(Arc::clone(replacement));
+            }
+            let Some(target_side) = target_side else {
+                continue;
+            };
+
+            let derived = Arc::clone(filter).with_new_children(replacements)?;
+            match target_side {
+                JoinSide::Left => left_filters.push(derived),
+                JoinSide::Right => right_filters.push(derived),
+                JoinSide::None => {}
+            }
+        }
+
+        Ok((left_filters, right_filters))
+    }
 }
 
 impl DisplayAs for HashJoinExec {
@@ -1867,7 +1973,7 @@ impl ExecutionPlan for HashJoinExec {
             _ => {}
         }
 
-        let left_child = if left_preserved {
+        let mut left_child = if left_preserved {
             ChildFilterDescription::from_child_with_allowed_indices(
                 &parent_filters,
                 left_allowed,
@@ -1902,6 +2008,24 @@ impl ExecutionPlan for HashJoinExec {
             right_child = right_child.with_self_filter(dynamic_filter);
         }
 
+        // In the Post phase a parent dynamic filter targeting one side's join
+        // key can be remapped onto the opposite side's key (they are equal for
+        // every emitted row). This is the transitive pushdown that lets e.g.
+        // an inner join filter its probe table using the keys a semi-join
+        // discovered for the build table. Run this after the join's own
+        // dynamic filter is added so [`Self::handle_child_pushdown_result`]
+        // can still find that producer first.
+        if phase == FilterPushdownPhase::Post {
+            let (left_filters, right_filters) =
+                self.transitive_dynamic_filters(&parent_filters, &column_indices)?;
+            if !left_filters.is_empty() {
+                left_child = left_child.with_self_filters(left_filters);
+            }
+            if !right_filters.is_empty() {
+                right_child = right_child.with_self_filters(right_filters);
+            }
+        }
+
         Ok(FilterDescription::new()
             .with_child(left_child)
             .with_child(right_child))
@@ -1915,8 +2039,21 @@ impl ExecutionPlan for HashJoinExec {
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         let mut result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2); // Should always be 2, we have 2 children
+
+        // Without a pending producer, there is nothing to link up. Guarding on
+        // `dynamic_filter.is_none()` also keeps a replan pass that only injects
+        // transitive (derived) filters — which are consumers of an *ancestor's*
+        // filter and must not be adopted as this join's own producer — from
+        // clobbering a filter already installed in a prior pass.
+        if self.dynamic_filter.is_some() {
+            return Ok(result);
+        }
+
         let right_child_self_filters = &child_pushdown_result.self_filters[1]; // We only push down filters to the right child
-        // We expect 0 or 1 self filters
+        // The join's own producer is added before any transitive (derived)
+        // filters, so it is always first here. Transitive filters are consumers
+        // of an ancestor's filter with a *different* `expression_id`, so it is
+        // crucial we only adopt this join's producer (the first entry).
         if let Some(filter) = right_child_self_filters.first() {
             let predicate = Arc::clone(&filter.predicate);
             if let Ok(dynamic_filter) =
@@ -8464,6 +8601,109 @@ mod tests {
             df.expression_id()
                 .expect("DynamicFilterPhysicalExpr always has an expression_id"),
         );
+        Ok(())
+    }
+
+    /// Verifies that a dynamic filter targeting a join key on one side of an
+    /// equi-join is transitively derived onto the opposite side even when the
+    /// two sides use different column names (e.g. `o_order_key` vs
+    /// `l_order_key`). This is what lets the second `lineitem` scan in TPC-H
+    /// Q18 be pruned by the semi-join's `[o_order_key IN (...)]` filter.
+    #[test]
+    fn test_inner_join_transitive_dynamic_filter_pushdown() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("o_order_key", DataType::Int32, false),
+            Field::new("l_payload", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("mo_order_key", DataType::Int32, false),
+            Field::new("r_payload", DataType::Int32, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1i32, 2])),
+                Arc::new(Int32Array::from(vec![10i32, 20])),
+            ],
+        )?;
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1i32, 2])),
+                Arc::new(Int32Array::from(vec![30i32, 40])),
+            ],
+        )?;
+        let left = TestMemoryExec::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+        let right =
+            TestMemoryExec::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+
+        // Left and right join keys have *different* names, which the name-based
+        // `FilterRemapper::try_remap` cannot translate on its own.
+        let on = vec![(
+            Arc::new(Column::new_with_schema("o_order_key", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("mo_order_key", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+        let config = session_config.options();
+
+        // A parent dynamic filter targeting the *left* join key (index 0 in the
+        // join output schema `[o_order_key, l_payload, mo_order_key, r_payload]`).
+        let parent_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(Column::new("o_order_key", 0))],
+            lit(true),
+        )) as Arc<dyn PhysicalExpr>;
+        let parent_expr_id = parent_filter
+            .expression_id()
+            .expect("dynamic filters always carry an expression id");
+
+        let desc = join.gather_filters_for_pushdown(
+            FilterPushdownPhase::Post,
+            vec![Arc::clone(&parent_filter)],
+            config,
+        )?;
+        let self_filters = desc.self_filters();
+        assert_eq!(self_filters.len(), 2, "one filter description per child");
+
+        // The derived filter must be pushed to the right (opposite) child.
+        let right_self = &self_filters[1];
+        assert!(
+            !right_self.is_empty(),
+            "expected at least the join's own dynamic filter plus the transitive one"
+        );
+        let derived = right_self
+            .iter()
+            .find(|f| f.expression_id() == Some(parent_expr_id))
+            .expect("expected a transitive derived dynamic filter");
+        let derived_df = derived
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .expect("transitive filter should remain a DynamicFilterPhysicalExpr");
+        // It must reference the right join key by name/index in the *right* schema.
+        let lhs_child = derived_df.children()[0]
+            .downcast_ref::<Column>()
+            .expect("transitive filter should target a column");
+        assert_eq!(lhs_child.name(), "mo_order_key");
+        assert_eq!(lhs_child.index(), 0);
+
+        // No derived filter should be placed on the left child (the parent filter
+        // already targets the left side and is handled through parent_filters).
+        assert!(self_filters[0].is_empty());
         Ok(())
     }
 
