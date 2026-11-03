@@ -219,13 +219,17 @@ impl Hash for ScalarFunctionExpr {
             fun,
             name,
             args,
-            return_field,
+            // `return_field` is not hashed: for functions returning large nested
+            // types (e.g. wide structs or unions) hashing it is expensive, and the
+            // cost repeats at every level of nested function calls. It is still
+            // compared in `PartialEq`, so equal values still hash equally; the hash
+            // is only coarser.
+            return_field: _,
             config_options: _, // expensive to hash, and often equal
         } = self;
         fun.hash(state);
         name.hash(state);
         args.hash(state);
-        return_field.hash(state);
     }
 }
 
@@ -833,5 +837,48 @@ mod tests {
         assert!(!stable_expr.is_volatile_node());
         let stable_arc: Arc<dyn PhysicalExpr> = Arc::new(stable_expr);
         assert!(!is_volatile(&stable_arc));
+    }
+
+    #[test]
+    fn hash_is_consistent_with_eq() {
+        use std::hash::{BuildHasher, RandomState};
+
+        fn struct_field(nullable: bool) -> FieldRef {
+            let fields = (0..8)
+                .map(|i| Field::new(format!("f{i}"), DataType::Int32, true))
+                .collect::<Vec<_>>();
+            Arc::new(Field::new(
+                "mock_function",
+                DataType::Struct(fields.into()),
+                nullable,
+            ))
+        }
+
+        let udf = Arc::new(ScalarUDF::from(MockScalarUDF {
+            signature: Signature::any(1, Volatility::Immutable),
+            return_type: struct_field(true).data_type().clone(),
+        }));
+        let config_options = Arc::new(ConfigOptions::default());
+        let make_expr = |return_field: FieldRef| {
+            ScalarFunctionExpr::new(
+                "mock_function",
+                Arc::clone(&udf),
+                vec![Arc::new(Column::new("a", 0))],
+                return_field,
+                Arc::clone(&config_options),
+            )
+        };
+
+        let hasher = RandomState::new();
+        // Separately allocated, but equal return fields
+        let expr = make_expr(struct_field(true));
+        let equal_expr = make_expr(struct_field(true));
+        assert_eq!(expr, equal_expr);
+        assert_eq!(hasher.hash_one(&expr), hasher.hash_one(&equal_expr));
+
+        // `return_field` is not hashed, but it is still compared
+        let other_expr = make_expr(struct_field(false));
+        assert_ne!(expr, other_expr);
+        assert_eq!(hasher.hash_one(&expr), hasher.hash_one(&other_expr));
     }
 }
