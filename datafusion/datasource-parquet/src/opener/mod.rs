@@ -325,6 +325,12 @@ impl Morselizer for ParquetMorselizer {
     fn set_split_files(&mut self, split: bool) {
         self.split_row_groups = split;
     }
+
+    fn prefers_ordered_read(&self) -> bool {
+        // Row groups (and files) are reordered for sort pushdown so that a
+        // TopK dynamic filter tightens as early as possible.
+        self.sort_order_for_reorder.is_some() || self.reverse_row_groups
+    }
 }
 
 /// States for [`ParquetMorselPlanner`]
@@ -790,17 +796,30 @@ impl ParquetMorselPlanner {
 impl ParquetMorselPlanner {
     /// Drive the push decoder to the next row group or I/O boundary.
     fn plan_decode(mut state: Box<PushDecoderStreamState>) -> Result<Option<MorselPlan>> {
-        if state.context.should_prune()? {
+        let step = state.next_step()?;
+        // A dynamic filter may have tightened since the last morsel: stop
+        // reading the file early if so, but only if there is work left (a
+        // finished file is not counted as pruned).
+        if !matches!(step, DecodeStep::Finished) && state.context.should_prune()? {
             return Ok(None);
         }
-        match state.next_step()? {
+        match step {
             DecodeStep::NeedsData(ranges) => {
                 let io_bytes = ranges
                     .iter()
                     .map(|r| usize::try_from(r.end - r.start).unwrap_or(usize::MAX))
                     .sum();
                 let io_future = async move {
-                    let state = state.fetch(ranges).await?;
+                    // Re-check dynamic row-group pruning at the latest point
+                    // before the I/O is issued: the future is only started
+                    // once it fits the scan's I/O budget, possibly long after
+                    // it was planned.
+                    let mut state = state;
+                    let state = if state.prune_pending_fetch() {
+                        state
+                    } else {
+                        state.fetch(ranges).await?
+                    };
                     Ok(Box::new(ParquetMorselPlanner {
                         state: ParquetOpenState::Decode(state),
                     }) as Box<dyn MorselPlanner>)
@@ -830,13 +849,6 @@ impl ParquetMorselPlanner {
 }
 
 impl MorselPlanner for ParquetMorselPlanner {
-    fn allow_prefetch(&self) -> bool {
-        // Row-group pruning driven by a dynamic filter (e.g. TopK) is more
-        // effective when the next row group is only considered after the
-        // current one has been read.
-        !matches!(&self.state, ParquetOpenState::Decode(state) if state.row_group_pruner.is_some())
-    }
-
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
         if matches!(self.state, ParquetOpenState::Done) {
             return Ok(None);
@@ -1884,16 +1896,9 @@ impl RowGroupsPrunedParquetOpen {
         // row groups can be fetched concurrently (and stolen by siblings).
         // Splitting is only done when no limit applies, since the decoder
         // limit is enforced per decoder.
-        //
-        // Scans whose row groups were reordered for sort pushdown (TopK) are
-        // not split either: they rely on reading the most promising row group
-        // first so the dynamic filter tightens before the remaining row
-        // groups are fetched, which eager per-row-group prefetch defeats.
         let split = prepared.split_row_groups
             && prepared.limit.is_none()
             && !prepared.preserve_order
-            && prepared.sort_order_for_reorder.is_none()
-            && !prepared.reverse_row_groups
             && rg_plan.len() > 1;
         let groups: Vec<(Vec<_>, VecDeque<RgPlanEntry>)> = if split {
             selections
@@ -1926,6 +1931,21 @@ impl RowGroupsPrunedParquetOpen {
             }
             _ => None,
         };
+
+        // One dynamic row-group pruner per file, shared by all its decoders
+        // (and the morsels they produce, which re-check it before decoding).
+        let row_group_pruner = watching_predicate
+            .filter(|_| split || groups.first().is_some_and(|(_, plan)| plan.len() > 1))
+            .map(|predicate| {
+                Arc::new(parking_lot::Mutex::new(RowGroupPruner::new(
+                    Arc::clone(predicate),
+                    Arc::clone(&prepared.physical_file_schema),
+                    Arc::clone(reader_metadata.metadata()),
+                    prepared.predicate_creation_errors.clone(),
+                    prepared.file_metrics.predicate_evaluation_errors.clone(),
+                    prepared.max_in_list_size,
+                )))
+            });
 
         let num_groups = groups.len();
         let mut reader = Some(prepared.async_file_reader);
@@ -1976,18 +1996,7 @@ impl RowGroupsPrunedParquetOpen {
                 }
             }
 
-            let row_group_pruner = watching_predicate
-                .filter(|_| split || rg_plan.len() > 1)
-                .map(|predicate| {
-                    RowGroupPruner::new(
-                        Arc::clone(predicate),
-                        Arc::clone(&prepared.physical_file_schema),
-                        Arc::clone(reader_metadata.metadata()),
-                        prepared.predicate_creation_errors.clone(),
-                        prepared.file_metrics.predicate_evaluation_errors.clone(),
-                        prepared.max_in_list_size,
-                    )
-                });
+            let row_group_pruner = row_group_pruner.clone();
 
             // Each decoder needs its own reader. The first one reuses the
             // reader that loaded the metadata.
@@ -3067,6 +3076,140 @@ mod test {
     /// with, so every one of these asserts the same invariant: by the time the
     /// stream is dropped it has advanced by exactly the size of the range,
     /// however the scan got there.
+    /// With I/O prefetch, the decision to fetch or decode a row group can be
+    /// made before a dynamic filter (e.g. from TopK) tightened. The dynamic
+    /// row-group pruner is therefore re-checked right before a row group's
+    /// I/O is issued and right before it is decoded.
+    mod late_dynamic_pruning {
+        use super::*;
+
+        struct Outcome {
+            values: Vec<i32>,
+            pruned_dynamic: usize,
+            bytes_scanned: usize,
+        }
+
+        /// Split a 3 row group file (`a`: 1..=3, 4..=6, 7..=9) into one
+        /// decoder per row group, filtered by a dynamic `a > 0` that is
+        /// tightened to `a > 6` either before the row groups' I/O is issued
+        /// (`tighten_before_io`) or after all row groups were fetched.
+        async fn run(tighten_before_io: bool) -> Outcome {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let batches = vec![
+                record_batch!(("a", Int32, vec![1, 2, 3])).unwrap(),
+                record_batch!(("a", Int32, vec![4, 5, 6])).unwrap(),
+                record_batch!(("a", Int32, vec![7, 8, 9])).unwrap(),
+            ];
+            let schema = batches[0].schema();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build();
+            let data_len = write_parquet_batches(
+                Arc::clone(&store),
+                "t.parquet",
+                batches,
+                Some(props),
+            )
+            .await;
+            let file = PartitionedFile::new("t.parquet", data_len as u64);
+
+            let gt = |v: i32| logical2physical(&col("a").gt(lit(v)), &schema);
+            let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::new(Column::new("a", 0)) as _],
+                gt(0),
+            ));
+            let metrics = ExecutionPlanMetricsSet::new();
+            let mut morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_predicate(Arc::clone(&dynamic) as _)
+                .with_metrics(metrics.clone())
+                .build();
+            morselizer.set_split_files(true);
+
+            let mut planners = VecDeque::from([morselizer.plan_file(file).unwrap()]);
+            let mut data_io = vec![];
+            let mut morsels: Vec<Box<dyn Morsel>> = vec![];
+            let mut tightened = false;
+            loop {
+                // CPU planning; metadata I/O is awaited, data I/O collected
+                while let Some(planner) = planners.pop_front() {
+                    let Some(mut plan) = planner.plan().unwrap() else {
+                        continue;
+                    };
+                    morsels.extend(plan.take_morsels());
+                    planners.extend(plan.take_ready_planners());
+                    if let Some(io) = plan.take_pending_planner() {
+                        if io.io_bytes().is_some() {
+                            data_io.push(io);
+                        } else {
+                            planners.push_front(io.await.unwrap());
+                        }
+                    }
+                }
+                if !tightened && (tighten_before_io || data_io.is_empty()) {
+                    assert_eq!(
+                        data_io.len(),
+                        if tighten_before_io { 3 } else { 0 },
+                        "one data I/O per row group decoder"
+                    );
+                    dynamic.update(gt(6)).unwrap();
+                    tightened = true;
+                }
+                if data_io.is_empty() {
+                    break;
+                }
+                for io in data_io.drain(..) {
+                    planners.push_back(io.await.unwrap());
+                }
+            }
+
+            let mut values = vec![];
+            for morsel in morsels {
+                let MorselStream::Sync(iter) = morsel.into_stream().unwrap() else {
+                    panic!("parquet morsels are sync");
+                };
+                for batch in iter {
+                    let batch = batch.unwrap();
+                    values.extend(
+                        batch.column(0).as_primitive::<Int32Type>().values().iter(),
+                    );
+                }
+            }
+            values.sort_unstable();
+            Outcome {
+                values,
+                pruned_dynamic: counter_metric_value(
+                    &metrics,
+                    "row_groups_pruned_dynamic_filter",
+                ),
+                bytes_scanned: counter_metric_value(&metrics, "bytes_scanned"),
+            }
+        }
+
+        #[tokio::test]
+        async fn prefetched_row_groups_are_pruned_before_decoding() {
+            let outcome = run(false).await;
+            assert_eq!(outcome.values, vec![7, 8, 9]);
+            assert_eq!(outcome.pruned_dynamic, 2);
+        }
+
+        #[tokio::test]
+        async fn planned_row_group_io_is_skipped_when_pruned_before_it_starts() {
+            let fetched_all = run(false).await;
+            let outcome = run(true).await;
+            assert_eq!(outcome.values, vec![7, 8, 9]);
+            assert_eq!(outcome.pruned_dynamic, 2);
+            assert!(
+                outcome.bytes_scanned < fetched_all.bytes_scanned,
+                "pruned row groups must not be fetched: {} vs {}",
+                outcome.bytes_scanned,
+                fetched_all.bytes_scanned
+            );
+        }
+    }
+
     mod bytes_processed {
         use super::*;
 

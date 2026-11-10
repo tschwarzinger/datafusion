@@ -88,8 +88,8 @@ pub(super) struct ScanState {
     on_error: OnError,
     /// Maximum bytes of in-flight + buffered I/O (see type docs).
     io_budget: usize,
-    /// Must the output preserve the order of the files / morsels?
-    preserve_order: bool,
+    /// In which order must / should morsels be read?
+    read_order: ReadOrder,
     /// May planners split files and donate parts to siblings?
     may_donate: bool,
     /// Open units of work, keyed by an increasing id.
@@ -194,7 +194,7 @@ impl ScanState {
             morselizer,
             on_error,
             io_budget: 0,
-            preserve_order: true,
+            read_order: ReadOrder::Required,
             may_donate: false,
             units: BTreeMap::new(),
             next_unit: 0,
@@ -220,9 +220,9 @@ impl ScanState {
         self
     }
 
-    /// Configure whether output order must be preserved.
-    pub(super) fn with_preserve_order(mut self, preserve_order: bool) -> Self {
-        self.preserve_order = preserve_order;
+    /// Configure the order in which morsels are read.
+    pub(super) fn with_read_order(mut self, read_order: ReadOrder) -> Self {
+        self.read_order = read_order;
         self
     }
 
@@ -458,11 +458,14 @@ impl ScanState {
         if self.ready_morsels.is_empty() {
             return None;
         }
-        if !self.preserve_order {
+        if self.read_order == ReadOrder::Any {
             return Some(0);
         }
         // Only the oldest open unit may produce output; its morsels are in
-        // production (= logical) order.
+        // production (= logical) order. Units are opened in the order the
+        // work source and morselizer prioritized the work (split planners
+        // get a unit each), so this reads in planned order even though their
+        // I/O may complete in any order.
         let oldest = *self.units.keys().next()?;
         self.ready_morsels.iter().position(|m| m.unit == oldest)
     }
@@ -479,7 +482,7 @@ impl ScanState {
             {
                 break;
             }
-            let Some((unit, planner)) = self.pop_plannable_planner() else {
+            let Some((unit, planner)) = self.ready_planners.pop_front() else {
                 break;
             };
             planned = true;
@@ -492,15 +495,23 @@ impl ScanState {
                     if !morsels.is_empty() {
                         self.settle(unit);
                     }
-                    // Donate all but the first planner to sibling streams if
-                    // the order does not matter and the planner split its work.
-                    if planners.len() > 1
-                        && self.may_donate
-                        && !self.preserve_order
-                        && let Some(shared) = self.work_source.shared()
-                    {
-                        let donated = planners.split_off(1);
-                        shared.donate(donated);
+                    // A planner that split its work into several independent
+                    // planners (only done when the order is not required):
+                    // keep the first, donate the others to sibling streams if
+                    // possible, otherwise track each as its own unit so they
+                    // are read in planned order (see `eligible_morsel_index`).
+                    if planners.len() > 1 && self.read_order != ReadOrder::Required {
+                        let split = planners.split_off(1);
+                        match self.work_source.shared() {
+                            Some(shared) if self.may_donate => shared.donate(split),
+                            _ => {
+                                for planner in split {
+                                    let child = self.new_unit(false, false);
+                                    self.add_outstanding(child, 1);
+                                    self.ready_planners.push_back((child, planner));
+                                }
+                            }
+                        }
                         self.settle(unit);
                     }
 
@@ -540,21 +551,6 @@ impl ScanState {
             }
         }
         planned.then_some(ScanAndReturn::Continue)
-    }
-
-    /// Pop the first ready planner that may be planned now (see
-    /// [`MorselPlanner::allow_prefetch`]).
-    fn pop_plannable_planner(&mut self) -> Option<(u64, Box<dyn MorselPlanner>)> {
-        let idx = self.ready_planners.iter().position(|(unit, planner)| {
-            planner.allow_prefetch() || !self.unit_has_pending_output(*unit)
-        })?;
-        self.ready_planners.remove(idx)
-    }
-
-    /// Does `unit` have morsels waiting to be read or being read?
-    fn unit_has_pending_output(&self, unit: u64) -> bool {
-        self.reader.as_ref().is_some_and(|r| r.unit == unit)
-            || self.ready_morsels.iter().any(|m| m.unit == unit)
     }
 
     /// If there is an active reader, poll it for the next batch.
@@ -703,6 +699,23 @@ impl ScanState {
             }
         }
     }
+}
+
+/// In which order a [`ScanState`] reads the morsels it has ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadOrder {
+    /// The output order is part of the scan's contract (e.g. the scan has an
+    /// output ordering): morsels are read strictly in planned order and work
+    /// is never split or shared.
+    Required,
+    /// Any order is correct, but the planned order is a priority that makes
+    /// the scan cheaper (e.g. row groups reordered so a TopK dynamic filter
+    /// tightens early). Morsels are read in planned order, waiting for the
+    /// next one if needed, while I/O is still prefetched and work may still
+    /// be split and shared with siblings.
+    Preferred,
+    /// Read whatever morsel is ready first.
+    Any,
 }
 
 /// What should be done on the next iteration of [`ScanState::poll_scan`]?

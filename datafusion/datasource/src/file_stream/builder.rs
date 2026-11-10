@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::file_scan_config::FileScanConfig;
-use crate::file_stream::scan_state::ScanState;
+use crate::file_stream::scan_state::{ReadOrder, ScanState};
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
@@ -138,6 +138,13 @@ impl<'a> FileStreamBuilder<'a> {
         };
         let split = split_morsels && io_budget_bytes > 0 && !preserve_order;
         morselizer.set_split_files(split);
+        let read_order = if preserve_order {
+            ReadOrder::Required
+        } else if morselizer.prefers_ordered_read() {
+            ReadOrder::Preferred
+        } else {
+            ReadOrder::Any
+        };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
         let scan_state = Box::new(
@@ -149,7 +156,7 @@ impl<'a> FileStreamBuilder<'a> {
                 file_stream_metrics,
             )
             .with_io_budget(io_budget_bytes)
-            .with_preserve_order(preserve_order)
+            .with_read_order(read_order)
             .with_may_donate(split),
         );
 

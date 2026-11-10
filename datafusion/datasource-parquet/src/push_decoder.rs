@@ -113,6 +113,9 @@ pub(crate) struct RgPlanEntry {
     pub(crate) bytes: u64,
 }
 
+/// A [`RowGroupPruner`] shared by the decoders and morsels of one file.
+pub(crate) type SharedRowGroupPruner = Arc<Mutex<RowGroupPruner>>;
+
 /// Runtime row-group pruner driven by a dynamic predicate (e.g. the
 /// threshold expression a `TopK` operator pushes down).
 ///
@@ -355,7 +358,10 @@ pub(crate) struct PushDecoderStreamState {
     /// [`ParquetPushDecoderBuilder::with_row_group_selections`] so the skipped RGs are
     /// bypassed entirely. `None` when the scan has no watching dynamic
     /// predicate or only one row group remains.
-    pub(crate) row_group_pruner: Option<RowGroupPruner>,
+    ///
+    /// Shared by all decoders of a file (when it is split per row group) and
+    /// by the morsels they produce, which re-check it right before decoding.
+    pub(crate) row_group_pruner: Option<SharedRowGroupPruner>,
     /// Count of row groups skipped at runtime by [`Self::row_group_pruner`].
     pub(crate) row_groups_pruned_dynamic: Count,
     /// Cache that lets the per-RG `fully_matched` toggle reinstall the
@@ -385,12 +391,36 @@ pub(crate) struct PushDecoderStreamState {
 pub(crate) struct DecodedRowGroupReader {
     reader: Option<ParquetRecordBatchReader>,
     context: Arc<DecodeContext>,
+    /// Re-check of the dynamic row-group pruner, done right before the first
+    /// batch is decoded (see [`LatePrune`]).
+    late_prune: Option<LatePrune>,
+}
+
+/// Re-check a row group against the dynamic row-group pruner right before it
+/// is decoded.
+///
+/// With I/O prefetch, the decision to fetch a row group is made before the
+/// consumer has seen the preceding output, i.e. before a dynamic filter (e.g.
+/// from TopK) had a chance to tighten. `FileStream` is pull based, so by the
+/// time a morsel starts decoding, every batch before it has been consumed:
+/// checking here is as informed as checking at the row-group boundary of a
+/// non-prefetching scan, and saves the decode work for pruned row groups.
+struct LatePrune {
+    pruner: SharedRowGroupPruner,
+    rg_index: usize,
+    row_groups_pruned_dynamic: Count,
 }
 
 impl Iterator for DecodedRowGroupReader {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(late) = self.late_prune.take()
+            && late.pruner.lock().should_prune(&[late.rg_index])
+        {
+            late.row_groups_pruned_dynamic.add(1);
+            self.reader = None;
+        }
         let reader = self.reader.as_mut()?;
         let elapsed_compute = self.context.baseline_metrics.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
@@ -566,12 +596,22 @@ impl PushDecoderStreamState {
                 // Pop the RG this reader is for. Its bytes are credited
                 // here rather than once the reader is drained: the decoder
                 // has already fetched them.
-                if let Some(entry) = self.rg_plan.pop_front() {
+                let entry = self.rg_plan.pop_front();
+                if let Some(entry) = &entry {
                     self.byte_progress.credit(entry.bytes);
                 }
+                let late_prune = match (&self.row_group_pruner, entry) {
+                    (Some(pruner), Some(entry)) => Some(LatePrune {
+                        pruner: Arc::clone(pruner),
+                        rg_index: entry.rg_index,
+                        row_groups_pruned_dynamic: self.row_groups_pruned_dynamic.clone(),
+                    }),
+                    _ => None,
+                };
                 Ok(DecodeStep::Reader(DecodedRowGroupReader {
                     reader: Some(reader),
                     context: Arc::clone(&self.context),
+                    late_prune,
                 }))
             }
             DecodeResult::Finished => {
@@ -584,6 +624,33 @@ impl PushDecoderStreamState {
     /// Release the decoder (and any buffered data) once finished.
     fn finish(&mut self) {
         self.decoder = None;
+    }
+
+    /// Re-check the dynamic row-group pruner right before the decoder's
+    /// pending I/O is issued, which (with an I/O budget) can be well after the
+    /// I/O was planned.
+    ///
+    /// Returns `true` if the I/O can be skipped: the decoder is waiting for
+    /// data of its last remaining row group, and that row group can now be
+    /// pruned, so the decoder is finished without fetching it. (When more row
+    /// groups follow, the decoder has already started this row group and can
+    /// not drop it; it is then re-checked before decoding instead, see
+    /// `LatePrune`.) Split decoders always hold a single row group.
+    pub(crate) fn prune_pending_fetch(&mut self) -> bool {
+        let (Some(pruner), Some(next)) =
+            (self.row_group_pruner.as_ref(), self.rg_plan.front())
+        else {
+            return false;
+        };
+        if self.rg_plan.len() != 1 || !pruner.lock().should_prune(&[next.rg_index]) {
+            return false;
+        }
+        self.row_groups_pruned_dynamic.add(1);
+        for entry in self.rg_plan.drain(..) {
+            self.byte_progress.credit(entry.bytes);
+        }
+        self.finish();
+        true
     }
 
     /// Fetch `ranges` and push them into the decoder.
@@ -670,9 +737,10 @@ impl PushDecoderStreamState {
     /// returning how many were pruned. The single decoder rebuild that acts on
     /// the survivors is left to the caller (at most one rebuild per boundary).
     fn prune_boundary_row_groups(&mut self) -> usize {
-        let Some(pruner) = self.row_group_pruner.as_mut() else {
+        let Some(pruner) = self.row_group_pruner.as_ref() else {
             return 0;
         };
+        let mut pruner = pruner.lock();
         let mut pruned_count = 0usize;
         let mut kept = VecDeque::with_capacity(self.rg_plan.len());
         while let Some(entry) = self.rg_plan.pop_front() {

@@ -427,6 +427,7 @@ impl MockPlannerBuilder {
 pub(crate) struct MockMorselizer {
     observer: MorselObserver,
     files: HashMap<String, MockPlanner>,
+    prefers_ordered_read: bool,
 }
 
 impl MockMorselizer {
@@ -446,9 +447,19 @@ impl MockMorselizer {
         self.files.insert(planner.file_path.clone(), planner);
         self
     }
+
+    /// Set the [`Morselizer::prefers_ordered_read`] hint.
+    pub(crate) fn with_prefers_ordered_read(mut self, prefers: bool) -> Self {
+        self.prefers_ordered_read = prefers;
+        self
+    }
 }
 
 impl Morselizer for MockMorselizer {
+    fn prefers_ordered_read(&self) -> bool {
+        self.prefers_ordered_read
+    }
+
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         let path = file.object_meta.location.to_string();
         self.observer

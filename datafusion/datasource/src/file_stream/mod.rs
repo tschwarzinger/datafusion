@@ -1446,6 +1446,59 @@ mod tests {
         Ok(())
     }
 
+    /// file1 needs (slow) I/O, file2's morsel is ready without any I/O.
+    fn slow_first_file(test: FileStreamMorselTest) -> FileStreamMorselTest {
+        test.with_file(
+            MockPlanner::builder("file1.parquet")
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(1),
+                    PollsToResolve(5),
+                    100,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(10), 41))
+                .return_none(),
+        )
+        .with_file(
+            MockPlanner::builder("file2.parquet")
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(11), 42))
+                .return_none(),
+        )
+        .with_io_budget_bytes(1000)
+    }
+
+    /// Without any ordering hint, the stream reads whichever morsel is ready
+    /// first instead of waiting for earlier work.
+    #[tokio::test]
+    async fn morsel_io_budget_reads_ready_morsel_first() -> Result<()> {
+        let snapshot = slow_first_file(FileStreamMorselTest::new()).run().await?;
+        assert!(
+            event_pos(&snapshot, "Batch: 42") < event_pos(&snapshot, "Batch: 41"),
+            "file2's morsel is ready first and should be read first:\n{snapshot}"
+        );
+        Ok(())
+    }
+
+    /// When the morselizer prefers ordered reads (e.g. row groups reordered
+    /// for a TopK dynamic filter), morsels are read in planned order even
+    /// though later work is ready first and order is not required. The later
+    /// work is still opened (prefetched) while waiting.
+    #[tokio::test]
+    async fn morsel_io_budget_prefers_planned_order() -> Result<()> {
+        let mut test = slow_first_file(FileStreamMorselTest::new());
+        test.morselizer = test.morselizer.with_prefers_ordered_read(true);
+        let snapshot = test.run().await?;
+        assert!(
+            event_pos(&snapshot, "morsel_produced: file2.parquet")
+                < event_pos(&snapshot, "io_future_resolved: file1.parquet"),
+            "file2 should be prefetched while file1's I/O is in flight:\n{snapshot}"
+        );
+        assert!(
+            event_pos(&snapshot, "Batch: 41") < event_pos(&snapshot, "Batch: 42"),
+            "output should follow planned order:\n{snapshot}"
+        );
+        Ok(())
+    }
+
     /// A planner that splits a file into several ready planners donates all
     /// but the first to sibling streams when splitting is enabled.
     #[tokio::test]

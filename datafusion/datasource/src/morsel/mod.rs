@@ -100,6 +100,17 @@ pub trait Morselizer: Send + Sync + Debug {
     /// `FileStream` only enables this when the scan does not need to preserve
     /// order and has an I/O budget. The default implementation ignores it.
     fn set_split_files(&mut self, _split: bool) {}
+
+    /// Does reading this morsel's output in planned order make the scan
+    /// cheaper, even though any order is correct?
+    ///
+    /// For example, a Parquet scan whose row groups were reordered so that a
+    /// TopK dynamic filter tightens as early as possible. `FileStream` then
+    /// still prefetches (and may split / share) work, but consumes it in
+    /// planned order. Defaults to `false`.
+    fn prefers_ordered_read(&self) -> bool {
+        false
+    }
 }
 
 /// A Morsel Planner is responsible for creating morsels for a given scan.
@@ -142,18 +153,6 @@ pub trait MorselPlanner: Send + Debug {
     ///
     /// See the comments on [`MorselPlan`] for the logical output order.
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>>;
-
-    /// May this planner be planned (and its I/O issued) while morsels it
-    /// logically follows are still waiting to be read?
-    ///
-    /// `FileStream` uses spare I/O budget to plan ahead. Planners whose
-    /// decisions benefit from seeing earlier output first (e.g. a Parquet
-    /// decoder whose row-group pruning tracks a TopK dynamic filter) can
-    /// return `false` to only be planned once the preceding morsels of the
-    /// same file have been read. Defaults to `true`.
-    fn allow_prefetch(&self) -> bool {
-        true
-    }
 }
 
 /// Return result of [`MorselPlanner::plan`].
