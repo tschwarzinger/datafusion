@@ -1347,6 +1347,159 @@ mod tests {
         Ok(())
     }
 
+    /// Two files whose planners each need one sized I/O.
+    fn two_sized_io_files(
+        test: FileStreamMorselTest,
+        polls: (usize, usize),
+    ) -> FileStreamMorselTest {
+        test.with_file(
+            MockPlanner::builder("file1.parquet")
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(1),
+                    PollsToResolve(polls.0),
+                    100,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(10), 41))
+                .return_none(),
+        )
+        .with_file(
+            MockPlanner::builder("file2.parquet")
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(2),
+                    PollsToResolve(polls.1),
+                    100,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(11), 42))
+                .return_none(),
+        )
+    }
+
+    /// Return the position of the first event containing `needle`.
+    fn event_pos(snapshot: &str, needle: &str) -> usize {
+        snapshot
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not found in:\n{snapshot}"))
+    }
+
+    /// With an I/O budget that fits both files' I/O, the stream issues the
+    /// second file's I/O while the first is still in flight.
+    #[tokio::test]
+    async fn morsel_io_budget_overlaps_io_across_files() -> Result<()> {
+        let test = two_sized_io_files(FileStreamMorselTest::new(), (3, 3))
+            .with_io_budget_bytes(1000);
+        let snapshot = test.run().await?;
+        assert!(snapshot.contains("Batch: 41") && snapshot.contains("Batch: 42"));
+        assert!(
+            event_pos(&snapshot, "morselize_file: file2.parquet")
+                < event_pos(&snapshot, "io_future_resolved: file1.parquet"),
+            "file2 should be opened while file1's I/O is in flight:\n{snapshot}"
+        );
+        Ok(())
+    }
+
+    /// Without a budget (the default) files are planned one at a time.
+    #[tokio::test]
+    async fn morsel_no_io_budget_keeps_io_sequential() -> Result<()> {
+        let test = two_sized_io_files(FileStreamMorselTest::new(), (3, 3));
+        let snapshot = test.run().await?;
+        assert!(
+            event_pos(&snapshot, "morselize_file: file2.parquet")
+                > event_pos(&snapshot, "morsel_stream_finished: MorselId(10)"),
+            "file2 should only be opened once file1 is done:\n{snapshot}"
+        );
+        Ok(())
+    }
+
+    /// I/O that does not fit in the budget is not started until earlier I/O
+    /// completes: with a budget of 150 bytes, only one 100 byte I/O runs.
+    #[tokio::test]
+    async fn morsel_io_budget_bounds_in_flight_io() -> Result<()> {
+        let test = two_sized_io_files(FileStreamMorselTest::new(), (3, 3))
+            .with_io_budget_bytes(150);
+        let snapshot = test.run().await?;
+        assert!(
+            event_pos(&snapshot, "io_future_polled: file2.parquet")
+                > event_pos(&snapshot, "io_future_resolved: file1.parquet"),
+            "file2's I/O must wait for budget:\n{snapshot}"
+        );
+        Ok(())
+    }
+
+    /// When order must be preserved, prefetched files never overtake earlier
+    /// files, even if their I/O completes first.
+    #[tokio::test]
+    async fn morsel_io_budget_preserves_order() -> Result<()> {
+        let test = two_sized_io_files(FileStreamMorselTest::new(), (8, 1))
+            .with_io_budget_bytes(1000)
+            .with_preserve_order(true);
+        let snapshot = test.run().await?;
+        assert!(
+            event_pos(&snapshot, "io_future_resolved: file2.parquet")
+                < event_pos(&snapshot, "io_future_resolved: file1.parquet"),
+            "test setup: file2's I/O should finish first:\n{snapshot}"
+        );
+        assert!(
+            event_pos(&snapshot, "Batch: 41") < event_pos(&snapshot, "Batch: 42"),
+            "output must stay in file order:\n{snapshot}"
+        );
+        Ok(())
+    }
+
+    /// A planner that splits a file into several ready planners donates all
+    /// but the first to sibling streams when splitting is enabled.
+    #[tokio::test]
+    async fn morsel_split_planners_are_donated_to_siblings() -> Result<()> {
+        let child = |name: &str, morsel: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(morsel),
+                    PollsToResolve(2),
+                    10,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(morsel), batch))
+                .return_none()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_file_in_partition(
+                PartitionId(0),
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(MockPlanBuilder::new().with_ready_planners(vec![
+                        child("rg0", 10, 41).into(),
+                        child("rg1", 11, 42).into(),
+                        child("rg2", 12, 43).into(),
+                    ]))
+                    .return_none(),
+            )
+            .with_file_in_partition(
+                PartitionId(1),
+                MockPlanner::builder("file2.parquet")
+                    .add_plan(MockPlanBuilder::new().with_morsel(MorselId(20), 51))
+                    .return_none(),
+            )
+            // budget for a single row group I/O, so partition 0 keeps one
+            // donated planner busy and leaves the others for partition 1
+            .with_io_budget_bytes(15)
+            .with_reads(vec![PartitionId(0), PartitionId(1)]);
+        let snapshot = test.run().await?;
+        for batch in [41, 42, 43, 51] {
+            assert!(snapshot.contains(&format!("Batch: {batch}")), "{snapshot}");
+        }
+        // partition 1 must have read at least one donated row group
+        let partition1 = snapshot
+            .split("----- Partition 1 -----")
+            .nth(1)
+            .and_then(|s| s.split("-----").next())
+            .unwrap_or_default();
+        assert!(
+            ["Batch: 42", "Batch: 43"]
+                .iter()
+                .any(|b| partition1.contains(b)),
+            "partition 1 should steal a donated planner:\n{snapshot}"
+        );
+        Ok(())
+    }
+
     /// Tests how one or more `FileStream`s consume morselized file work.
     #[derive(Clone)]
     struct FileStreamMorselTest {
@@ -1359,6 +1512,7 @@ mod tests {
         build_streams_on_first_read: bool,
         reads: Vec<PartitionId>,
         limit: Option<usize>,
+        io_budget_bytes: usize,
     }
 
     impl FileStreamMorselTest {
@@ -1374,7 +1528,14 @@ mod tests {
                 build_streams_on_first_read: false,
                 reads: vec![],
                 limit: None,
+                io_budget_bytes: 0,
             }
+        }
+
+        /// Sets `datafusion.execution.scan_io_budget_bytes` for all streams.
+        fn with_io_budget_bytes(mut self, io_budget_bytes: usize) -> Self {
+            self.io_budget_bytes = io_budget_bytes;
+            self
         }
 
         /// Adds one file and its root planner to partition 0.
@@ -1512,6 +1673,7 @@ mod tests {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())
+                        .with_io_budget_bytes(self.io_budget_bytes)
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;
@@ -1539,6 +1701,7 @@ mod tests {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())
+                        .with_io_budget_bytes(self.io_budget_bytes)
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;

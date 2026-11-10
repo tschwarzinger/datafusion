@@ -22,6 +22,8 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    io_budget_bytes: usize,
+    split_morsels: bool,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -34,6 +36,8 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            io_budget_bytes: 0,
+            split_morsels: true,
         }
     }
 
@@ -80,6 +84,19 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Configure the I/O budget (see `datafusion.execution.scan_io_budget_bytes`).
+    pub fn with_io_budget_bytes(mut self, io_budget_bytes: usize) -> Self {
+        self.io_budget_bytes = io_budget_bytes;
+        self
+    }
+
+    /// Configure whether files may be split into independent morsels
+    /// (see `datafusion.execution.scan_split_morsels`).
+    pub fn with_split_morsels(mut self, split_morsels: bool) -> Self {
+        self.split_morsels = split_morsels;
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -89,12 +106,14 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            io_budget_bytes,
+            split_morsels,
         } = self;
 
         let Some(partition) = partition else {
             return internal_err!("FileStreamBuilder missing required partition");
         };
-        let Some(morselizer) = morselizer else {
+        let Some(mut morselizer) = morselizer else {
             return internal_err!("FileStreamBuilder missing required morselizer");
         };
         let Some(metrics) = metrics else {
@@ -111,14 +130,28 @@ impl<'a> FileStreamBuilder<'a> {
             None => WorkSource::Local(file_group.into_inner().into()),
         };
 
+        let preserve_order = config.preserves_file_order();
+        let io_budget_bytes = if config.limit.is_some() {
+            0
+        } else {
+            io_budget_bytes
+        };
+        let split = split_morsels && io_budget_bytes > 0 && !preserve_order;
+        morselizer.set_split_files(split);
+
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
-        let scan_state = Box::new(ScanState::new(
-            work_source,
-            config.limit,
-            morselizer,
-            on_error,
-            file_stream_metrics,
-        ));
+        let scan_state = Box::new(
+            ScanState::new(
+                work_source,
+                config.limit,
+                morselizer,
+                on_error,
+                file_stream_metrics,
+            )
+            .with_io_budget(io_budget_bytes)
+            .with_preserve_order(preserve_order)
+            .with_may_donate(split),
+        );
 
         Ok(FileStream {
             projected_schema,

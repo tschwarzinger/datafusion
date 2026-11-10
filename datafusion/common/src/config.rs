@@ -1132,6 +1132,27 @@ config_namespace! {
         /// runtime reassignment occurs.
         pub enable_file_stream_work_stealing: bool, default = true
 
+        /// Per-partition budget, in bytes, for file scan I/O that is in
+        /// flight or fetched but not yet decoded.
+        ///
+        /// With `0` (the default) each scan partition has at most one I/O
+        /// outstanding, and fetching and decoding strictly alternate. With a
+        /// non-zero value, a scan partition issues further I/O (the next
+        /// row groups of a Parquet file, further files, or work donated by
+        /// sibling partitions) while it decodes, as long as the bytes of
+        /// in-flight I/O plus fetched-but-not-yet-decoded data stay within
+        /// this budget. Larger values help most on high-latency object
+        /// stores. Ignored for scans with a row limit.
+        pub scan_io_budget_bytes: usize, default = 0
+
+        /// When `true` (the default) and `scan_io_budget_bytes` is non-zero,
+        /// scans that do not need to preserve order may split a file into
+        /// independently fetched units (for Parquet: one per row group). This
+        /// lets one partition fetch several row groups of a file concurrently
+        /// and lets idle sibling partitions steal row groups (when
+        /// `enable_file_stream_work_stealing` is enabled).
+        pub scan_split_morsels: bool, default = true
+
         /// Aggregation ratio (number of distinct groups / number of input rows)
         /// threshold for skipping partial aggregation. If the value is greater
         /// then partial aggregation will skip aggregation for further input

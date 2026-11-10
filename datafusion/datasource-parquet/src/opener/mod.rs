@@ -4,11 +4,9 @@
 
 //! [`ParquetMorselizer`] state machines for opening Parquet files
 
-mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 
-use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
 use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
@@ -16,8 +14,9 @@ use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
-    DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, RgPlanEntry,
-    RowFilterContext, RowGroupPruner,
+    DecodeContext, DecodeStep, DecodedRowGroupReader, DecoderBuilderConfig,
+    PushDecoderStreamState, RgPlanEntry, RowFilterContext, RowGroupPruner,
+    SharedFilePruner,
 };
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
 use crate::{
@@ -25,9 +24,10 @@ use crate::{
     ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn, RowGroupAccess,
     schema_coercion::apply_file_schema_type_coercions_with_rle,
 };
-use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
-use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
+use datafusion_datasource::morsel::{
+    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, PendingMorselPlanner,
+};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::rewrite::rewrite_input_file_name_in_projection;
 use datafusion_physical_expr_adapter::{
@@ -64,7 +64,7 @@ use datafusion_pruning::{FilePruner, PruningPredicate, PruningPredicateBuilder};
 use datafusion_common::config::EncryptionFactoryOptions;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
+use futures::{FutureExt, future::BoxFuture};
 use log::debug;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
@@ -301,6 +301,9 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    /// Split files into one independent planner per row group (see
+    /// [`Morselizer::set_split_files`]).
+    pub(crate) split_row_groups: bool,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -317,6 +320,10 @@ impl fmt::Debug for ParquetMorselizer {
 impl Morselizer for ParquetMorselizer {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
+    }
+
+    fn set_split_files(&mut self, split: bool) {
+        self.split_row_groups = split;
     }
 }
 
@@ -355,7 +362,12 @@ impl Morselizer for ParquetMorselizer {
 /// PruneWithBloomFilters
 ///        |
 ///        v
-///   BuildStream
+///   BuildDecoder ---> (one Decode per row group when splitting)
+///        |
+///        v
+///     Decode <----+  (yields one morsel per fully fetched row group,
+///        |        |   or schedules the I/O for the next one)
+///        +--------+
 ///        |
 ///        v
 ///       Done
@@ -389,12 +401,11 @@ enum ParquetOpenState {
     LoadBloomFilters(BoxFuture<'static, Result<BloomFiltersLoadedParquetOpen>>),
     /// Pruning with preloaded Bloom Filters
     PruneWithBloomFilters(Box<BloomFiltersLoadedParquetOpen>),
-    /// Builds the final reader stream
-    ///
-    /// TODO: split state as this currently does both I/O and CPU work.
-    BuildStream(Box<RowGroupsPrunedParquetOpen>),
-    /// Terminal state: the final opened stream is ready to return.
-    Ready(BoxStream<'static, Result<RecordBatch>>),
+    /// Builds the push decoder(s) (CPU only)
+    BuildDecoder(Box<RowGroupsPrunedParquetOpen>),
+    /// Driving a push decoder: each step either yields a fully fetched row
+    /// group as a morsel, or discovers the next I/O.
+    Decode(Box<PushDecoderStreamState>),
     /// Terminal state: reading complete
     Done,
 }
@@ -412,8 +423,8 @@ impl fmt::Debug for ParquetOpenState {
             ParquetOpenState::PruneWithStatistics(_) => "PruneWithStatistics",
             ParquetOpenState::LoadBloomFilters(_) => "LoadBloomFilters",
             ParquetOpenState::PruneWithBloomFilters(_) => "PruneWithBloomFilters",
-            ParquetOpenState::BuildStream(_) => "BuildStream",
-            ParquetOpenState::Ready(_) => "Ready",
+            ParquetOpenState::BuildDecoder(_) => "BuildDecoder",
+            ParquetOpenState::Decode(_) => "Decode",
             ParquetOpenState::Done => "Done",
         };
         f.write_str(state)
@@ -494,6 +505,7 @@ struct PreparedParquetOpen {
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
+    split_row_groups: bool,
     #[cfg(feature = "parquet_encryption")]
     file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
 }
@@ -687,12 +699,12 @@ impl ParquetOpenState {
                 if pruned.row_groups.is_fully_pruned() {
                     return Ok(ParquetOpenState::Done);
                 }
-                Ok(ParquetOpenState::BuildStream(Box::new(pruned)))
+                Ok(ParquetOpenState::BuildDecoder(Box::new(pruned)))
             }
-            ParquetOpenState::BuildStream(prepared) => {
-                Ok(ParquetOpenState::Ready(prepared.build_stream()?))
+            // handled by `ParquetMorselPlanner::plan`
+            state @ (ParquetOpenState::BuildDecoder(_) | ParquetOpenState::Decode(_)) => {
+                Ok(state)
             }
-            ParquetOpenState::Ready(stream) => Ok(ParquetOpenState::Ready(stream)),
             ParquetOpenState::Done => {
                 panic!("ParquetOpenFuture polled after completion");
             }
@@ -700,27 +712,28 @@ impl ParquetOpenState {
     }
 }
 
-/// Implements the Morsel API
-struct ParquetStreamMorsel {
-    stream: BoxStream<'static, Result<RecordBatch>>,
+/// Implements the Morsel API: one fully fetched row group, decoded
+/// synchronously.
+struct ParquetRowGroupMorsel {
+    reader: DecodedRowGroupReader,
+    buffered_bytes: usize,
 }
 
-impl ParquetStreamMorsel {
-    fn new(stream: BoxStream<'static, Result<RecordBatch>>) -> Self {
-        Self { stream }
-    }
-}
-
-impl fmt::Debug for ParquetStreamMorsel {
+impl fmt::Debug for ParquetRowGroupMorsel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ParquetStreamMorsel")
+        f.debug_struct("ParquetRowGroupMorsel")
+            .field("buffered_bytes", &self.buffered_bytes)
             .finish_non_exhaustive()
     }
 }
 
-impl Morsel for ParquetStreamMorsel {
-    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
-        self.stream
+impl Morsel for ParquetRowGroupMorsel {
+    fn into_stream(self: Box<Self>) -> Result<MorselStream> {
+        Ok(MorselStream::Sync(Box::new(self.reader)))
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
     }
 }
 
@@ -774,7 +787,56 @@ impl ParquetMorselPlanner {
     }
 }
 
+impl ParquetMorselPlanner {
+    /// Drive the push decoder to the next row group or I/O boundary.
+    fn plan_decode(mut state: Box<PushDecoderStreamState>) -> Result<Option<MorselPlan>> {
+        if state.context.should_prune()? {
+            return Ok(None);
+        }
+        match state.next_step()? {
+            DecodeStep::NeedsData(ranges) => {
+                let io_bytes = ranges
+                    .iter()
+                    .map(|r| usize::try_from(r.end - r.start).unwrap_or(usize::MAX))
+                    .sum();
+                let io_future = async move {
+                    let state = state.fetch(ranges).await?;
+                    Ok(Box::new(ParquetMorselPlanner {
+                        state: ParquetOpenState::Decode(state),
+                    }) as Box<dyn MorselPlanner>)
+                };
+                Ok(Some(MorselPlan::new().with_pending(
+                    PendingMorselPlanner::new(io_future).with_io_bytes(io_bytes),
+                )))
+            }
+            DecodeStep::Reader(reader) => {
+                let buffered_bytes = mem::take(&mut state.fetched_bytes);
+                let morsel: Box<dyn Morsel> = Box::new(ParquetRowGroupMorsel {
+                    reader,
+                    buffered_bytes,
+                });
+                let next: Box<dyn MorselPlanner> = Box::new(ParquetMorselPlanner {
+                    state: ParquetOpenState::Decode(state),
+                });
+                Ok(Some(
+                    MorselPlan::new()
+                        .with_morsels(vec![morsel])
+                        .with_planners(vec![next]),
+                ))
+            }
+            DecodeStep::Finished => Ok(None),
+        }
+    }
+}
+
 impl MorselPlanner for ParquetMorselPlanner {
+    fn allow_prefetch(&self) -> bool {
+        // Row-group pruning driven by a dynamic filter (e.g. TopK) is more
+        // effective when the next row group is only considered after the
+        // current one has been read.
+        !matches!(&self.state, ParquetOpenState::Decode(state) if state.row_group_pruner.is_some())
+    }
+
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
         if matches!(self.state, ParquetOpenState::Done) {
             return Ok(None);
@@ -808,11 +870,19 @@ impl MorselPlanner for ParquetMorselPlanner {
                     )))
                 })))
             }
-            ParquetOpenState::Ready(stream) => {
-                let morsels: Vec<Box<dyn Morsel>> =
-                    vec![Box::new(ParquetStreamMorsel::new(stream))];
-                Ok(Some(MorselPlan::new().with_morsels(morsels)))
+            ParquetOpenState::BuildDecoder(prepared) => {
+                let planners: Vec<Box<dyn MorselPlanner>> = prepared
+                    .build_decoders()?
+                    .into_iter()
+                    .map(|state| {
+                        Box::new(Self {
+                            state: ParquetOpenState::Decode(Box::new(state)),
+                        }) as _
+                    })
+                    .collect();
+                Ok(Some(MorselPlan::new().with_planners(planners)))
             }
+            ParquetOpenState::Decode(state) => Self::plan_decode(state),
             ParquetOpenState::Done => Ok(None),
             cpu_state => Ok(Some(
                 MorselPlan::new()
@@ -1016,6 +1086,7 @@ impl ParquetMorselizer {
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
+            split_row_groups: self.split_row_groups,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,
         })
@@ -1033,7 +1104,7 @@ impl PreparedParquetOpen {
         // planning time. The `FilePruner` (built when the predicate is dynamic or
         // the file carries statistics) also watches any still-active dynamic
         // filter, so the
-        // `EarlyStoppingStream` wrapping the scan can re-check after each batch
+        // row-group morsels of the scan can re-check after each batch
         // and end the stream early once a tightened filter proves the file can
         // be skipped.
         //
@@ -1610,8 +1681,12 @@ impl BloomFiltersLoadedParquetOpen {
 }
 
 impl RowGroupsPrunedParquetOpen {
-    /// Build the final parquet stream once all pruning work is complete.
-    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    /// Build the push decoder(s) once all pruning work is complete.
+    ///
+    /// Returns a single decoder state, or — when row-group splitting is
+    /// enabled — one decoder state per row group whose morsels may be read
+    /// in any order.
+    fn build_decoders(self) -> Result<Vec<PushDecoderStreamState>> {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
@@ -1717,110 +1792,36 @@ impl RowGroupsPrunedParquetOpen {
         // scans defer this work until the stream is built.
         let DecoderReadPlans {
             projection: decoder_projection,
-            row_filter_context: precomputed_context,
+            row_filter_context,
         } = match decoder_read_plans {
             Some(plans) => plans,
             None => DecoderReadPlans::try_new(&prepared, &reader_metadata)?,
         };
 
-        // Lazily-registered suppression counter shared by the open-time first-RG
-        // skip below and the stream's per-RG toggle (registered on first use so
-        // scans that never suppress don't carry a zero-valued counter).
-        let mut row_filter_skipped_fully_matched =
-            RowFilterSkippedFullyMatchedMetric::new(
-                &prepared.metrics,
-                prepared.partition_index,
-                &prepared.file_name,
-            );
-        let InitialDecoderState {
-            decoder,
-            rg_plan,
-            has_row_selection,
-            filter_installed,
-            row_filter_context,
-        } = {
-            // Build the prepared access plan first — `prepare_access_plan` may
-            // call `reorder_by_statistics` (for `sort_order_for_reorder`) and
-            // `reverse` (for `reverse_row_groups`), both of which arrange row
-            // groups in the physical scan order the decoder will read.
-            // We MUST build our `rg_plan` from this reordered
-            // list, otherwise our per-RG pruner check would consult the
-            // metadata of a different RG than the decoder is about to yield.
-            let decoder_config = DecoderBuilderConfig {
-                projection_mask: decoder_projection.projection_mask(),
-                batch_size: prepared.batch_size,
-                arrow_reader_metrics: &arrow_reader_metrics,
-                force_filter_selections: prepared.force_filter_selections,
-                decoder_limit: prepared.limit,
-            };
-
-            let prepared_access_plan = prepare_access_plan(access_plan)?;
-            let has_row_selection = prepared_access_plan.has_row_selection;
-            // Move selections into the decoder, retaining only the metadata
-            // needed for pruning, filter toggles, and byte accounting.
-            let (selections, rg_plan): (Vec<_>, VecDeque<RgPlanEntry>) =
-                prepared_access_plan
-                    .row_groups
-                    .into_iter()
-                    .map(|rg| {
-                        let rg_index = rg.selection.row_group_index();
-                        let entry = RgPlanEntry {
-                            rg_index,
-                            bytes: row_group_bytes(&rg_metadata[rg_index]),
-                            fully_matched: rg.fully_matched,
-                        };
-                        (rg.selection, entry)
-                    })
-                    .unzip();
-
-            // Decide the initial row filter state based on the first RG to
-            // read. If that RG is `fully_matched` the per-row predicate is
-            // a no-op for every row, so we install an empty `RowFilter`
-            // (arrow-rs's `has_predicates` check then short-circuits the
-            // per-row eval) and the stream toggles back to the real filter
-            // at the first non-fully-matched RG boundary.
-            //
-            // `RowFilterContext` carries everything `build_row_filter`
-            // needs so the stream can regenerate the filter later — the
-            // installed filter is owned by the decoder and is not
-            // recoverable once replaced.
-            let first_rg_fully_matched = rg_plan.front().is_some_and(|e| e.fully_matched);
-            let row_filter_context = precomputed_context;
-
-            let mut builder = decoder_config.build(selections, reader_metadata.clone());
-            let mut filter_installed = false;
-            if let Some(ctx) = row_filter_context.as_ref() {
-                if first_rg_fully_matched {
-                    // The first RG is fully matched: install an empty filter
-                    // and count the suppression, exactly as the per-RG toggle
-                    // does mid-scan, so the metric is consistent whether the
-                    // skip happens at open time or at a later boundary. The
-                    // real filter is only built (lazily, from the prebuilt
-                    // candidates) at the first non-fully-matched boundary.
-                    builder = builder.with_row_filter(
-                        parquet::arrow::arrow_reader::RowFilter::new(vec![]),
-                    );
-                    row_filter_skipped_fully_matched.add_one();
-                } else {
-                    builder = builder.with_row_filter(ctx.build_row_filter());
-                    filter_installed = true;
-                    if let Some(max_predicate_cache_size) =
-                        prepared.max_predicate_cache_size
-                    {
-                        builder = builder
-                            .with_max_predicate_cache_size(max_predicate_cache_size);
-                    }
-                }
-            }
-
-            InitialDecoderState {
-                decoder: builder.build()?,
-                rg_plan,
-                has_row_selection,
-                filter_installed,
-                row_filter_context,
-            }
-        };
+        // Build the prepared access plan first — `prepare_access_plan` may
+        // call `reorder_by_statistics` (for `sort_order_for_reorder`) and
+        // `reverse` (for `reverse_row_groups`), both of which arrange row
+        // groups in the physical scan order the decoder will read.
+        // We MUST build our `rg_plan` from this reordered
+        // list, otherwise our per-RG pruner check would consult the
+        // metadata of a different RG than the decoder is about to yield.
+        let prepared_access_plan = prepare_access_plan(access_plan)?;
+        let has_row_selection = prepared_access_plan.has_row_selection;
+        // Move selections into the decoder, retaining only the metadata
+        // needed for pruning, filter toggles, and byte accounting.
+        let (selections, rg_plan): (Vec<_>, VecDeque<RgPlanEntry>) = prepared_access_plan
+            .row_groups
+            .into_iter()
+            .map(|rg| {
+                let rg_index = rg.selection.row_group_index();
+                let entry = RgPlanEntry {
+                    rg_index,
+                    bytes: row_group_bytes(&rg_metadata[rg_index]),
+                    fully_matched: rg.fully_matched,
+                };
+                (rg.selection, entry)
+            })
+            .unzip();
 
         // Track how much of this file range the scan has finished with. Credit
         // up front every row group it will not read: those pruning removed, and
@@ -1849,13 +1850,60 @@ impl RowGroupsPrunedParquetOpen {
         let planned_bytes: u64 = rg_plan.iter().map(|entry| entry.bytes).sum();
         byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
 
-        let predicate_cache_inner_records =
-            prepared.file_metrics.predicate_cache_inner_records.clone();
-        let predicate_cache_records =
-            prepared.file_metrics.predicate_cache_records.clone();
+        // Wrap the decoders so a dynamic filter can stop the file scan early,
+        // but only when the pruner is still watching a filter that can change
+        // mid-scan. For a static (or already-complete) predicate the up-front
+        // `prune_file` check already captured everything that can be pruned, so
+        // per-batch re-checking would only add overhead.
+        let file_pruner = match prepared.file_pruner {
+            Some(file_pruner) if file_pruner.is_watching() => {
+                Some(SharedFilePruner::new(
+                    file_pruner,
+                    prepared.file_metrics.files_ranges_pruned_statistics.clone(),
+                ))
+            }
+            _ => None,
+        };
 
-        let files_ranges_pruned_statistics =
-            prepared.file_metrics.files_ranges_pruned_statistics.clone();
+        let context = Arc::new(DecodeContext {
+            decoder_projection,
+            arrow_reader_metrics: arrow_reader_metrics.clone(),
+            predicate_cache_inner_records: prepared
+                .file_metrics
+                .predicate_cache_inner_records
+                .clone(),
+            predicate_cache_records: prepared
+                .file_metrics
+                .predicate_cache_records
+                .clone(),
+            baseline_metrics: prepared.baseline_metrics.clone(),
+            file_pruner,
+        });
+
+        // Split the scan into one decoder per row group when allowed, so the
+        // row groups can be fetched concurrently (and stolen by siblings).
+        // Splitting is only done when no limit applies, since the decoder
+        // limit is enforced per decoder.
+        //
+        // Scans whose row groups were reordered for sort pushdown (TopK) are
+        // not split either: they rely on reading the most promising row group
+        // first so the dynamic filter tightens before the remaining row
+        // groups are fetched, which eager per-row-group prefetch defeats.
+        let split = prepared.split_row_groups
+            && prepared.limit.is_none()
+            && !prepared.preserve_order
+            && prepared.sort_order_for_reorder.is_none()
+            && !prepared.reverse_row_groups
+            && rg_plan.len() > 1;
+        let groups: Vec<(Vec<_>, VecDeque<RgPlanEntry>)> = if split {
+            selections
+                .into_iter()
+                .zip(rg_plan)
+                .map(|(selection, entry)| (vec![selection], VecDeque::from([entry])))
+                .collect()
+        } else {
+            vec![(selections, rg_plan)]
+        };
 
         // Build a dynamic row-group pruner only when all three conditions hold:
         //   1) the scan has a predicate (so there is something to evaluate),
@@ -1864,71 +1912,119 @@ impl RowGroupsPrunedParquetOpen {
         //      predicates were fully consumed by `prune_by_statistics` at file
         //      open, so re-evaluating them per RG boundary would be wasted work,
         //   3) there is at least one pending RG that could be skipped.
-        // The pruner subscribes once to every still-incomplete dynamic filter
-        // via the `DynamicFilterTracker` watch channel (#22460), so detecting
-        // a threshold change is a single atomic load — not a tree walk per
-        // RG check.
         // Preserve the current policy for scans with selections. Enabling
         // runtime pruning for them is separate from adopting the local API
         // and is tracked in https://github.com/apache/datafusion/issues/24358.
-        let row_group_pruner =
-            match (&prepared.predicate, rg_plan.len() > 1, has_row_selection) {
-                (Some(predicate), true, false)
-                    if matches!(
-                        DynamicFilterTracking::classify(predicate),
-                        DynamicFilterTracking::Watching(_)
-                    ) =>
-                {
-                    Some(RowGroupPruner::new(
+        let watching_predicate = match (&prepared.predicate, has_row_selection) {
+            (Some(predicate), false)
+                if matches!(
+                    DynamicFilterTracking::classify(predicate),
+                    DynamicFilterTracking::Watching(_)
+                ) =>
+            {
+                Some(predicate)
+            }
+            _ => None,
+        };
+
+        let num_groups = groups.len();
+        let mut reader = Some(prepared.async_file_reader);
+        let mut states = Vec::with_capacity(num_groups);
+        for (group_idx, (selections, rg_plan)) in groups.into_iter().enumerate() {
+            // Lazily-registered suppression counter shared by the open-time
+            // first-RG skip below and the per-RG toggle.
+            let mut row_filter_skipped_fully_matched =
+                RowFilterSkippedFullyMatchedMetric::new(
+                    &prepared.metrics,
+                    prepared.partition_index,
+                    &prepared.file_name,
+                );
+            let decoder_config = DecoderBuilderConfig {
+                projection_mask: context.decoder_projection.projection_mask(),
+                batch_size: prepared.batch_size,
+                arrow_reader_metrics: &arrow_reader_metrics,
+                force_filter_selections: prepared.force_filter_selections,
+                decoder_limit: prepared.limit,
+            };
+
+            // Decide the initial row filter state based on the first RG to
+            // read. If that RG is `fully_matched` the per-row predicate is
+            // a no-op for every row, so we install an empty `RowFilter`
+            // (arrow-rs's `has_predicates` check then short-circuits the
+            // per-row eval) and the decoder toggles back to the real filter
+            // at the first non-fully-matched RG boundary.
+            let first_rg_fully_matched = rg_plan.front().is_some_and(|e| e.fully_matched);
+            let row_filter_context = row_filter_context.clone();
+
+            let mut builder = decoder_config.build(selections, reader_metadata.clone());
+            let mut filter_installed = false;
+            if let Some(ctx) = row_filter_context.as_ref() {
+                if first_rg_fully_matched {
+                    builder = builder.with_row_filter(
+                        parquet::arrow::arrow_reader::RowFilter::new(vec![]),
+                    );
+                    row_filter_skipped_fully_matched.add_one();
+                } else {
+                    builder = builder.with_row_filter(ctx.build_row_filter());
+                    filter_installed = true;
+                    if let Some(max_predicate_cache_size) =
+                        prepared.max_predicate_cache_size
+                    {
+                        builder = builder
+                            .with_max_predicate_cache_size(max_predicate_cache_size);
+                    }
+                }
+            }
+
+            let row_group_pruner = watching_predicate
+                .filter(|_| split || rg_plan.len() > 1)
+                .map(|predicate| {
+                    RowGroupPruner::new(
                         Arc::clone(predicate),
                         Arc::clone(&prepared.physical_file_schema),
                         Arc::clone(reader_metadata.metadata()),
                         prepared.predicate_creation_errors.clone(),
                         prepared.file_metrics.predicate_evaluation_errors.clone(),
                         prepared.max_in_list_size,
-                    ))
-                }
-                _ => None,
-            };
-        let row_groups_pruned_dynamic = prepared
-            .file_metrics
-            .row_groups_pruned_dynamic_filter
-            .clone();
-        let stream = PushDecoderStreamState {
-            decoder: Some(decoder),
-            active_reader: None,
-            rg_plan,
-            reader: prepared.async_file_reader,
-            decoder_projection,
-            arrow_reader_metrics,
-            predicate_cache_inner_records,
-            predicate_cache_records,
-            baseline_metrics: prepared.baseline_metrics,
-            row_group_pruner,
-            row_groups_pruned_dynamic,
-            row_filter_context,
-            filter_installed,
-            row_filter_skipped_fully_matched,
-            byte_progress,
-        }
-        .into_stream();
+                    )
+                });
 
-        // Wrap the stream so a dynamic filter can stop the file scan early, but
-        // only when the pruner is still watching a filter that can change
-        // mid-scan. For a static (or already-complete) predicate the up-front
-        // `prune_file` check already captured everything that can be pruned, so
-        // per-batch re-checking would only add overhead.
-        match prepared.file_pruner {
-            Some(file_pruner) if file_pruner.is_watching() => {
-                Ok(EarlyStoppingStream::new(
-                    stream,
-                    file_pruner,
-                    files_ranges_pruned_statistics,
-                )
-                .boxed())
-            }
-            _ => Ok(stream),
+            // Each decoder needs its own reader. The first one reuses the
+            // reader that loaded the metadata.
+            let group_reader = match reader.take() {
+                Some(reader) => reader,
+                None => prepared.parquet_file_reader_factory.create_reader(
+                    prepared.partition_index,
+                    prepared.partitioned_file.clone(),
+                    prepared.metadata_size_hint,
+                    &prepared.metrics,
+                )?,
+            };
+            let group_progress = if group_idx + 1 == num_groups {
+                // the last group takes whatever is left
+                byte_progress.split_off(u64::MAX)
+            } else {
+                byte_progress.split_off(rg_plan.iter().map(|e| e.bytes).sum())
+            };
+
+            states.push(PushDecoderStreamState {
+                decoder: Some(builder.build()?),
+                rg_plan,
+                reader: group_reader,
+                context: Arc::clone(&context),
+                row_group_pruner,
+                row_groups_pruned_dynamic: prepared
+                    .file_metrics
+                    .row_groups_pruned_dynamic_filter
+                    .clone(),
+                row_filter_context,
+                filter_installed,
+                row_filter_skipped_fully_matched,
+                byte_progress: group_progress,
+                fetched_bytes: 0,
+            });
         }
+        Ok(states)
     }
 }
 
@@ -2656,46 +2752,97 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
+                split_row_groups: false,
             })
         }
     }
 
-    /// Test helper that drives a [`ParquetMorselizer`] to completion and returns
-    /// the first stream morsel it produces.
+    /// Test helper that drives a [`ParquetMorselizer`] and returns a stream
+    /// with the output of all its morsels, in logical order.
     ///
     /// This mirrors how `FileStream` consumes the morsel APIs: it repeatedly
     /// plans CPU work, awaits any discovered I/O futures, and feeds the planner
-    /// back into the ready queue until a stream morsel is ready.
+    /// back into the ready queue. Planning is lazy: the next morsel is only
+    /// planned once the previous one is exhausted, so tests can observe the
+    /// scan's progress batch by batch. Opening loads metadata and prunes
+    /// eagerly, stopping before the first row-group data is fetched.
     async fn open_file(
         morselizer: &dyn Morselizer,
         file: PartitionedFile,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let mut planners = VecDeque::from([morselizer.plan_file(file)?]);
-        let mut morsels: VecDeque<Box<dyn Morsel>> = VecDeque::new();
+        struct State {
+            planners: VecDeque<Box<dyn MorselPlanner>>,
+            morsels: VecDeque<Box<dyn Morsel>>,
+            current: Option<MorselStream>,
+            /// Data I/O discovered while opening, not awaited yet.
+            deferred: Option<PendingMorselPlanner>,
+        }
 
-        loop {
-            if let Some(morsel) = morsels.pop_front() {
-                return Ok(Box::pin(morsel.into_stream()));
-            }
-
-            let Some(planner) = planners.pop_front() else {
-                return Ok(Box::pin(futures::stream::empty()));
-            };
-
-            if let Some(mut plan) = planner.plan()? {
-                morsels.extend(plan.take_morsels());
-                planners.extend(plan.take_ready_planners());
-
-                if let Some(pending_planner) = plan.take_pending_planner() {
-                    planners.push_front(pending_planner.await?);
-                    continue;
-                }
-
-                if morsels.is_empty() && planners.is_empty() {
-                    return internal_err!("planner returned an empty morsel plan");
+        impl State {
+            /// Plan until a morsel is available. Returns `false` when done.
+            ///
+            /// With `stop_at_data_io`, stops (returning `true`) before
+            /// awaiting the first I/O of known size, i.e. row-group data.
+            async fn next_morsel(&mut self, stop_at_data_io: bool) -> Result<bool> {
+                loop {
+                    if let Some(morsel) = self.morsels.pop_front() {
+                        self.current = Some(morsel.into_stream()?);
+                        return Ok(true);
+                    }
+                    if let Some(pending) = self.deferred.take() {
+                        self.planners.push_front(pending.await?);
+                    }
+                    let Some(planner) = self.planners.pop_front() else {
+                        return Ok(false);
+                    };
+                    if let Some(mut plan) = planner.plan()? {
+                        self.morsels.extend(plan.take_morsels());
+                        let mut ready = plan.take_ready_planners();
+                        // keep logical order: children before older planners
+                        while let Some(p) = ready.pop() {
+                            self.planners.push_front(p);
+                        }
+                        if let Some(pending_planner) = plan.take_pending_planner() {
+                            if stop_at_data_io && pending_planner.io_bytes().is_some() {
+                                self.deferred = Some(pending_planner);
+                                return Ok(true);
+                            }
+                            self.planners.push_front(pending_planner.await?);
+                        }
+                    }
                 }
             }
         }
+
+        let mut state = State {
+            planners: VecDeque::from([morselizer.plan_file(file)?]),
+            morsels: VecDeque::new(),
+            current: None,
+            deferred: None,
+        };
+        // Load metadata and prune, like opening a file used to.
+        state.next_morsel(true).await?;
+
+        Ok(futures::stream::unfold(state, |mut state| async move {
+            loop {
+                if let Some(current) = state.current.as_mut() {
+                    let next = match current {
+                        MorselStream::Sync(iter) => iter.next(),
+                        MorselStream::Async(stream) => stream.next().await,
+                    };
+                    match next {
+                        Some(batch) => return Some((batch, state)),
+                        None => state.current = None,
+                    }
+                }
+                match state.next_morsel(false).await {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(e) => return Some((Err(e), state)),
+                }
+            }
+        })
+        .boxed())
     }
 
     /// Drives a [`ParquetMorselizer`] to completion and returns how many
@@ -3300,7 +3447,8 @@ mod test {
         assert_eq!(morsels(col("a").gt(lit(10))).await, 0);
         // Statistics keep both row groups; their Bloom filters prune both.
         assert_eq!(morsels(col("a").eq(lit(1))).await, 0);
-        assert_eq!(morsels(col("a").eq(lit(2))).await, 1);
+        // One morsel per surviving row group.
+        assert_eq!(morsels(col("a").eq(lit(2))).await, 2);
     }
 
     #[tokio::test]
