@@ -9,7 +9,7 @@ use std::task::Waker;
 use crate::PartitionedFile;
 use crate::file_groups::FileGroup;
 use crate::file_scan_config::FileScanConfig;
-use crate::morsel::MorselPlanner;
+use crate::morsel::{Morsel, MorselPlanner};
 use parking_lot::Mutex;
 
 /// A unit of work handed out by a [`WorkSource`].
@@ -110,13 +110,62 @@ impl std::fmt::Debug for SharedWorkSourceInner {
         f.debug_struct("SharedWorkSourceInner")
             .field("files", &state.files)
             .field("planners", &state.planners.len())
+            .field("morsels", &state.morsels.len())
             .field("planning", &state.planning)
             .finish()
     }
 }
 
+/// A fetched morsel published to the shared pool by the stream that fetched
+/// it (its owner), so that any sibling stream with an idle decoder can read
+/// it.
+pub(super) struct PooledMorsel {
+    pub(super) morsel: Box<dyn Morsel>,
+    /// `Morsel::buffered_bytes`, charged to the owner's I/O budget until the
+    /// morsel is taken.
+    pub(super) bytes: usize,
+    /// The owner's unit of work this morsel belongs to.
+    pub(super) unit: u64,
+    /// Where to notify the owner once the morsel is taken.
+    pub(super) owner: Arc<MorselInbox>,
+}
+
+/// Notifications for a stream that some of its pooled morsels were taken,
+/// which releases their bytes from its I/O budget and may finish its units.
+#[derive(Default)]
+pub(super) struct MorselInbox {
+    taken: Mutex<Vec<(u64, usize)>>,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl MorselInbox {
+    /// Record that the morsel of `unit` holding `bytes` was taken, and wake
+    /// the owner so it can use the freed budget.
+    pub(super) fn notify(&self, unit: u64, bytes: usize) {
+        self.taken.lock().push((unit, bytes));
+        if let Some(waker) = self.waker.lock().take() {
+            waker.wake();
+        }
+    }
+
+    /// Register the owner's waker.
+    pub(super) fn register(&self, waker: &Waker) {
+        let mut slot = self.waker.lock();
+        if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    /// Take all notifications.
+    pub(super) fn drain(&self) -> Vec<(u64, usize)> {
+        std::mem::take(&mut *self.taken.lock())
+    }
+}
+
 #[derive(Default)]
 struct SharedState {
+    /// Fetched morsels, ready to be read by any stream.
+    morsels: VecDeque<PooledMorsel>,
     /// Donated planners, handed out before any unopened file.
     planners: VecDeque<Box<dyn MorselPlanner>>,
     /// Unopened files.
@@ -206,6 +255,25 @@ impl SharedWorkSource {
             state.planners.push_front(planner);
         }
         state.wake_all();
+    }
+
+    /// Publish a fetched morsel so any stream may read it.
+    pub(super) fn publish(&self, morsel: PooledMorsel) {
+        let mut state = self.inner.state.lock();
+        state.morsels.push_back(morsel);
+        state.wake_all();
+    }
+
+    /// Take the oldest published morsel, notifying its owner.
+    pub(super) fn take_morsel(&self) -> Option<PooledMorsel> {
+        let morsel = self.inner.state.lock().morsels.pop_front()?;
+        morsel.owner.notify(morsel.unit, morsel.bytes);
+        Some(morsel)
+    }
+
+    /// Is any published morsel waiting?
+    pub(super) fn has_morsels(&self) -> bool {
+        !self.inner.state.lock().morsels.is_empty()
     }
 
     /// Record that a file taken from this queue will not donate any more

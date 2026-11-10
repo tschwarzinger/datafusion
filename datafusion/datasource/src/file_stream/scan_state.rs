@@ -14,8 +14,9 @@ use datafusion_common_runtime::SpawnedTask;
 use datafusion_physical_plan::metrics::ScopedTimerGuard;
 use futures::{FutureExt as _, StreamExt as _};
 
-use super::work_source::{NextWork, WorkItem, WorkSource};
+use super::work_source::{MorselInbox, NextWork, PooledMorsel, WorkItem, WorkSource};
 use super::{FileStreamMetrics, OnError, StartableTime};
+use std::sync::Arc;
 
 /// Maximum number of units of work (files or donated planners) a single
 /// stream keeps open at the same time, regardless of the I/O budget.
@@ -92,6 +93,9 @@ pub(super) struct ScanState {
     read_order: ReadOrder,
     /// May planners split files and donate parts to siblings?
     may_donate: bool,
+    /// Inbox for notifications about this stream's pooled morsels being
+    /// taken, when morsels are pooled (see [`Self::pools_morsels`]).
+    inbox: Arc<MorselInbox>,
     /// Open units of work, keyed by an increasing id.
     units: BTreeMap<u64, Unit>,
     /// Id for the next unit of work.
@@ -196,6 +200,7 @@ impl ScanState {
             io_budget: 0,
             read_order: ReadOrder::Required,
             may_donate: false,
+            inbox: Arc::default(),
             units: BTreeMap::new(),
             next_unit: 0,
             ready_planners: Default::default(),
@@ -237,6 +242,40 @@ impl ScanState {
     /// Updates how scan errors are handled while the stream is still active.
     pub(super) fn set_on_error(&mut self, on_error: OnError) {
         self.on_error = on_error;
+    }
+
+    /// Are fetched morsels published to the shared pool, so any sibling
+    /// stream may read them?
+    ///
+    /// Only when work is shared anyway and the read order does not matter.
+    /// Without the pool, work a stream claimed to prefetch it can no longer
+    /// be balanced between streams: when I/O is fast (e.g. local SSD) a
+    /// stream may claim a large share of the work before its siblings, and
+    /// the query waits for the most loaded stream.
+    fn pools_morsels(&self) -> bool {
+        self.may_donate
+            && self.read_order == ReadOrder::Any
+            && self.work_source.shared().is_some()
+    }
+
+    /// Apply notifications that pooled morsels of this stream were taken.
+    fn drain_inbox(&mut self, cx: &Context<'_>) {
+        if !self.pools_morsels() {
+            return;
+        }
+        self.inbox.register(cx.waker());
+        for (unit, bytes) in self.inbox.drain() {
+            self.buffered_bytes -= bytes;
+            self.release(unit);
+        }
+    }
+
+    /// Apply inbox notifications without registering a waker.
+    fn drain_inbox_now(&mut self) {
+        for (unit, bytes) in self.inbox.drain() {
+            self.buffered_bytes -= bytes;
+            self.release(unit);
+        }
     }
 
     fn legacy(&self) -> bool {
@@ -343,6 +382,9 @@ impl ScanState {
     pub(super) fn poll_scan(&mut self, cx: &mut Context<'_>) -> ScanAndReturn {
         let time_processing = self.metrics.time_processing.clone();
         let _timer: ScopedTimerGuard<'_> = time_processing.timer();
+
+        // 0. account for pooled morsels taken by any stream
+        self.drain_inbox(cx);
 
         // 1. resolve started I/O
         if let Some(ret) = self.poll_in_flight(cx) {
@@ -451,6 +493,8 @@ impl ScanState {
 
     fn has_eligible_morsel(&self) -> bool {
         self.eligible_morsel_index().is_some()
+            || (self.pools_morsels()
+                && self.work_source.shared().is_some_and(|s| s.has_morsels()))
     }
 
     /// Index of the next morsel that may become the active reader.
@@ -519,14 +563,26 @@ impl ScanState {
                         unit,
                         morsels.len() + planners.len() + usize::from(pending.is_some()),
                     );
+                    let pool = self
+                        .pools_morsels()
+                        .then(|| self.work_source.shared().cloned())
+                        .flatten();
                     for morsel in morsels {
                         let bytes = morsel.buffered_bytes();
                         self.buffered_bytes += bytes;
-                        self.ready_morsels.push_back(ReadyMorsel {
-                            unit,
-                            morsel,
-                            bytes,
-                        });
+                        match &pool {
+                            Some(pool) => pool.publish(PooledMorsel {
+                                morsel,
+                                bytes,
+                                unit,
+                                owner: Arc::clone(&self.inbox),
+                            }),
+                            None => self.ready_morsels.push_back(ReadyMorsel {
+                                unit,
+                                morsel,
+                                bytes,
+                            }),
+                        }
                     }
                     for planner in planners {
                         self.ready_planners.push_back((unit, planner));
@@ -622,12 +678,27 @@ impl ScanState {
     /// Turn the next eligible ready morsel into the active reader.
     fn start_next_morsel(&mut self) -> Option<ScanAndReturn> {
         debug_assert!(self.reader.is_none());
-        let idx = self.eligible_morsel_index()?;
         let ReadyMorsel {
             unit,
             morsel,
             bytes,
-        } = self.ready_morsels.remove(idx).expect("index valid");
+        } = if self.pools_morsels() {
+            let pooled = self.work_source.shared()?.take_morsel()?;
+            // The owner (possibly this stream) was notified and releases the
+            // morsel from its unit and budget; this stream reads it as a unit
+            // of its own.
+            self.drain_inbox_now();
+            let unit = self.new_unit(false, false);
+            self.add_outstanding(unit, 1);
+            ReadyMorsel {
+                unit,
+                morsel: pooled.morsel,
+                bytes: 0,
+            }
+        } else {
+            let idx = self.eligible_morsel_index()?;
+            self.ready_morsels.remove(idx).expect("index valid")
+        };
         self.metrics.time_opening.stop();
         start_timer(&mut self.metrics.time_scanning_until_data);
         start_timer(&mut self.metrics.time_scanning_total);

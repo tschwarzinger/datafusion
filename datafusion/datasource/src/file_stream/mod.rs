@@ -1553,6 +1553,61 @@ mod tests {
         Ok(())
     }
 
+    /// A stream with enough budget claims (and fetches) all row groups of a
+    /// split file before its sibling is polled. The fetched morsels are
+    /// published to the shared pool, so the sibling still reads some of them
+    /// instead of idling while one stream decodes everything.
+    #[tokio::test]
+    async fn morsel_pool_balances_prefetched_work() -> Result<()> {
+        let child = |name: &str, morsel: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(morsel),
+                    PollsToResolve(0),
+                    10,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(morsel), batch))
+                .return_none()
+                .into()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_file_in_partition(
+                PartitionId(0),
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(
+                        MockPlanBuilder::new().with_ready_planners(
+                            (0..6)
+                                .map(|i| child(&format!("rg{i}"), 10 + i, 41 + i as i32))
+                                .collect(),
+                        ),
+                    )
+                    .return_none(),
+            )
+            .with_file_in_partition(
+                PartitionId(1),
+                MockPlanner::builder("file2.parquet").return_none(),
+            )
+            .with_io_budget_bytes(1000)
+            .with_file_stream_events(false)
+            .with_reads(vec![PartitionId(0)]);
+        let snapshot = test.run().await?;
+        let partition = |p: usize| {
+            snapshot
+                .split(&format!("----- Partition {p} -----"))
+                .nth(1)
+                .and_then(|s| s.split("----- ").next())
+                .unwrap_or_default()
+                .matches("Batch:")
+                .count()
+        };
+        assert_eq!(partition(0) + partition(1), 6, "{snapshot}");
+        assert!(
+            partition(1) > 0,
+            "partition 1 should read pooled morsels:\n{snapshot}"
+        );
+        Ok(())
+    }
+
     /// Tests how one or more `FileStream`s consume morselized file work.
     #[derive(Clone)]
     struct FileStreamMorselTest {
