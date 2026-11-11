@@ -9,7 +9,7 @@ use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
 use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_order};
 use crate::pruning::build_inverted_predicate;
-use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use arrow::compute::nullif;
 use arrow::datatypes::Schema;
 use datafusion_common::parquet_config::RowGroupRangeAssignment;
@@ -460,44 +460,95 @@ impl RowGroupAccessPlanFilter {
         let _timer_guard = metrics.bloom_filter_eval_time.timer();
 
         assert_eq!(row_group_bloom_filters.len(), self.access_plan.len());
-        for (idx, stats) in row_group_bloom_filters.iter().enumerate() {
-            if !self.access_plan.should_scan(idx) {
-                continue;
+        let row_groups = (0..row_group_bloom_filters.len())
+            .filter(|&idx| {
+                // Statistics already proved every row of a fully matched group
+                // matches. Bloom does not evaluate this group, so do not record a
+                // Bloom outcome. A row group without any loaded bloom filter cannot
+                // be pruned by this pass, so it is skipped as well.
+                self.access_plan.should_scan(idx)
+                    && !self.access_plan.is_fully_matched(idx)
+                    && !row_group_bloom_filters[idx].is_empty()
+            })
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return;
+        }
+
+        // Evaluate the predicate once for all row groups instead of once per row
+        // group. Each evaluation builds a statistics batch and evaluates the entire
+        // predicate expression, which dominates for files with many row groups.
+        let statistics = MultiRowGroupBloomFilterStatistics {
+            row_groups: row_groups
+                .iter()
+                .map(|&idx| &row_group_bloom_filters[idx])
+                .collect(),
+        };
+        let keep = match predicate.prune(&statistics) {
+            Ok(keep) => keep,
+            Err(e) => {
+                log::debug!("Error evaluating row group predicate on bloom filter: {e}");
+                metrics.predicate_evaluation_errors.add(row_groups.len());
+                return;
             }
+        };
 
-            if self.access_plan.is_fully_matched(idx) {
-                // Statistics already proved every row matches. Bloom did not
-                // evaluate this group, so do not record a Bloom outcome.
-                continue;
-            }
-
-            // A row group without any loaded bloom filter cannot be pruned by this pass: with no
-            // bloom statistics to consult, evaluation can only conclude "may match". Skip the
-            // evaluation in that case: it runs once per row group and can be expensive for wide
-            // predicates, a cost files written without bloom filters would pay for nothing.
-            if stats.is_empty() {
-                continue;
-            }
-
-            // Can this group be pruned?
-            let prune_group = match predicate.prune(stats) {
-                Ok(values) => !values[0],
-                Err(e) => {
-                    log::debug!(
-                        "Error evaluating row group predicate on bloom filter: {e}"
-                    );
-                    metrics.predicate_evaluation_errors.add(1);
-                    continue;
-                }
-            };
-
-            if prune_group {
+        for (idx, keep) in row_groups.into_iter().zip(keep) {
+            if keep {
+                metrics.row_groups_pruned_bloom_filter.add_matched(1);
+            } else {
                 metrics.row_groups_pruned_bloom_filter.add_pruned(1);
                 self.access_plan.skip(idx)
-            } else {
-                metrics.row_groups_pruned_bloom_filter.add_matched(1);
             }
         }
+    }
+}
+
+/// Combines the [`BloomFilterStatistics`] of several row groups, such that a
+/// [`PruningPredicate`] can be evaluated for all of them at once. Each row group
+/// is one container.
+struct MultiRowGroupBloomFilterStatistics<'a> {
+    row_groups: Vec<&'a BloomFilterStatistics>,
+}
+
+impl PruningStatistics for MultiRowGroupBloomFilterStatistics<'_> {
+    fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn max_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn num_containers(&self) -> usize {
+        self.row_groups.len()
+    }
+
+    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        None
+    }
+
+    fn contained(
+        &self,
+        column: &Column,
+        values: &HashSet<ScalarValue>,
+    ) -> Option<BooleanArray> {
+        let mut any_known = false;
+        let contained = self
+            .row_groups
+            .iter()
+            .map(|stats| {
+                // A row group without a Bloom filter for the column is unknown.
+                let result = stats.contained(column, values)?;
+                any_known = true;
+                result.is_valid(0).then(|| result.value(0))
+            })
+            .collect::<BooleanArray>();
+        any_known.then_some(contained)
     }
 }
 
