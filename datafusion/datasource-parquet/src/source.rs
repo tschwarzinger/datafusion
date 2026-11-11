@@ -321,6 +321,10 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// If false, the opener prunes with statistics and the page index only using
+    /// the conjuncts of the predicate that contain a dynamic filter. See
+    /// [`Self::with_static_predicate_pruning`].
+    static_predicate_pruning: bool,
 }
 
 impl ParquetSource {
@@ -350,7 +354,29 @@ impl ParquetSource {
             reverse_rows: false,
             memory_pool: None,
             sort_order_for_reorder: None,
+            static_predicate_pruning: true,
         }
+    }
+
+    /// Whether the conjuncts of the predicate that do not contain a dynamic filter
+    /// are used to prune row groups (using statistics) and pages (using the page
+    /// index) when a file is opened. Defaults to `true`.
+    ///
+    /// Disable this if the access plans of the files (see [`ParquetAccessPlan`])
+    /// were already pruned with these conjuncts, for example, by a custom planner
+    /// that prunes files eagerly. Pruning with statistics and the page index then
+    /// only uses dynamic filters (e.g., of hash joins), which are unknown while
+    /// planning. Bloom filters and row filtering still use the complete predicate.
+    ///
+    /// [`ParquetAccessPlan`]: crate::ParquetAccessPlan
+    pub fn with_static_predicate_pruning(mut self, enabled: bool) -> Self {
+        self.static_predicate_pruning = enabled;
+        self
+    }
+
+    /// See [`Self::with_static_predicate_pruning`].
+    pub fn static_predicate_pruning(&self) -> bool {
+        self.static_predicate_pruning
     }
 
     /// Set the `TableParquetOptions` for this ParquetSource.
@@ -638,6 +664,7 @@ impl FileSource for ParquetSource {
             enable_page_index: self.enable_page_index(),
             enable_bloom_filter: self.bloom_filter_on_read(),
             enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
+            static_predicate_pruning: self.static_predicate_pruning,
             coerce_int96,
             coerce_int96_tz,
             #[cfg(feature = "parquet_encryption")]
@@ -1165,6 +1192,9 @@ impl FileSource for ParquetSource {
             // Runtime only: set when the scan is opened.
             memory_pool: _,
             sort_order_for_reorder,
+            // Not serialized: only affects performance. The default (pruning
+            // with the complete predicate) is always correct.
+            static_predicate_pruning: _,
         } = self;
 
         if schema_provider.is_some() {

@@ -49,9 +49,12 @@ use datafusion_common::{
     ColumnStatistics, HashSet, Result, ScalarValue, Statistics, exec_err, internal_err,
 };
 use datafusion_datasource::{PartitionedFile, TableSchema};
-use datafusion_physical_expr::expressions::{Column, DynamicFilterTracking, Literal};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, DynamicFilterTracking, Literal,
+};
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::{conjunction_opt, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -268,6 +271,10 @@ pub(super) struct ParquetMorselizer {
     pub enable_bloom_filter: bool,
     /// Should row group pruning be applied
     pub enable_row_group_stats_pruning: bool,
+    /// Should the conjuncts of the predicate without dynamic filters be used for
+    /// pruning with statistics and the page index (see
+    /// [`ParquetSource::with_static_predicate_pruning`](crate::source::ParquetSource::with_static_predicate_pruning))
+    pub static_predicate_pruning: bool,
     /// Coerce INT96 timestamps to specific TimeUnit
     pub coerce_int96: Option<TimeUnit>,
     /// Optional timezone applied to INT96-coerced timestamps. When `Some`, the
@@ -467,6 +474,7 @@ struct PreparedParquetOpen {
     enable_page_index: bool,
     enable_bloom_filter: bool,
     enable_row_group_stats_pruning: bool,
+    static_predicate_pruning: bool,
     /// True when substituting the columns `constant_columns_from_stats`
     /// proved constant for this file is on its own enough to collapse the
     /// predicate to a constant no row can satisfy — see `prune_row_groups`.
@@ -522,6 +530,9 @@ struct MetadataLoadedParquetOpen {
 struct FiltersPreparedParquetOpen {
     loaded: MetadataLoadedParquetOpen,
     pruning_predicate: Option<Arc<PruningPredicate>>,
+    /// The predicate for pruning with Bloom filters. Unlike `pruning_predicate`,
+    /// it always includes the static conjuncts (see `static_predicate_pruning`).
+    bloom_filter_predicate: Option<Arc<PruningPredicate>>,
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
 }
 
@@ -1010,6 +1021,7 @@ impl ParquetMorselizer {
             enable_page_index: self.enable_page_index,
             enable_bloom_filter: self.enable_bloom_filter,
             enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
+            static_predicate_pruning: self.static_predicate_pruning,
             stats_prove_unsatisfiable,
             stats_constant_columns_in_predicate,
             limit: self.limit,
@@ -1246,17 +1258,35 @@ impl MetadataLoadedParquetOpen {
             prepared.stats_prove_unsatisfiable = false;
         }
 
-        // Build predicates for this specific file
+        // Build predicates for this specific file. If the static conjuncts were
+        // already used for pruning with statistics and the page index (e.g., while
+        // planning), only the conjuncts with dynamic filters are used for these.
+        let pruning_source = if prepared.static_predicate_pruning {
+            prepared.predicate.clone()
+        } else {
+            prepared.predicate.as_ref().and_then(dynamic_conjuncts)
+        };
         let pruning_predicate = build_pruning_predicates(
-            prepared.predicate.as_ref(),
+            pruning_source.as_ref(),
             &physical_file_schema,
             &prepared.predicate_creation_errors,
             prepared.max_in_list_size,
         );
+        let bloom_filter_predicate =
+            if prepared.static_predicate_pruning || !prepared.enable_bloom_filter {
+                pruning_predicate.clone()
+            } else {
+                build_pruning_predicates(
+                    prepared.predicate.as_ref(),
+                    &physical_file_schema,
+                    &prepared.predicate_creation_errors,
+                    prepared.max_in_list_size,
+                )
+            };
 
         // Only build page pruning predicate if page index is enabled
         let page_pruning_predicate = if prepared.enable_page_index {
-            prepared.predicate.as_ref().and_then(|predicate| {
+            pruning_source.as_ref().and_then(|predicate| {
                 let p = build_page_pruning_predicate(
                     predicate,
                     &physical_file_schema,
@@ -1275,6 +1305,7 @@ impl MetadataLoadedParquetOpen {
                 options,
             },
             pruning_predicate,
+            bloom_filter_predicate,
             page_pruning_predicate,
         })
     }
@@ -1526,8 +1557,11 @@ impl RowGroupsPrunedParquetOpen {
         let mut row_group_bloom_filters =
             vec![BloomFilterStatistics::new(); num_row_groups];
 
-        if let Some(predicate) =
-            self.prepared.pruning_predicate.as_ref().map(|p| p.as_ref())
+        if let Some(predicate) = self
+            .prepared
+            .bloom_filter_predicate
+            .as_ref()
+            .map(|p| p.as_ref())
             && self.prepared.loaded.prepared.enable_bloom_filter
             && !self.row_groups.is_empty()
             && self
@@ -1628,7 +1662,7 @@ impl BloomFiltersLoadedParquetOpen {
         if let Some(predicate) = self
             .prepared
             .prepared
-            .pruning_predicate
+            .bloom_filter_predicate
             .as_ref()
             .map(|p| p.as_ref())
             && self.prepared.prepared.loaded.prepared.enable_bloom_filter
@@ -1656,6 +1690,7 @@ impl RowGroupsPrunedParquetOpen {
         let FiltersPreparedParquetOpen {
             loaded,
             pruning_predicate: _,
+            bloom_filter_predicate: _,
             page_pruning_predicate,
         } = prepared;
         let MetadataLoadedParquetOpen {
@@ -2203,6 +2238,23 @@ async fn load_page_index<T: AsyncFileReader>(
     }
 }
 
+/// Returns the conjunction of the conjuncts of `predicate` that contain a dynamic
+/// filter, or `None` if there are none.
+fn dynamic_conjuncts(predicate: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn PhysicalExpr>> {
+    let conjuncts = split_conjunction(predicate)
+        .into_iter()
+        .filter(|conjunct| {
+            conjunct
+                .exists(|expr| {
+                    Ok(expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some())
+                })
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    conjunction_opt(conjuncts)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -2286,6 +2338,7 @@ mod test {
         enable_page_index: bool,
         enable_bloom_filter: bool,
         enable_row_group_stats_pruning: bool,
+        static_predicate_pruning: bool,
         coerce_int96: Option<TimeUnit>,
         max_predicate_cache_size: Option<usize>,
         max_in_list_size: usize,
@@ -2479,6 +2532,7 @@ mod test {
                     options,
                 },
                 pruning_predicate: None,
+                bloom_filter_predicate: None,
                 page_pruning_predicate,
             },
             row_groups: RowGroupAccessPlanFilter::new(plan),
@@ -2508,6 +2562,7 @@ mod test {
                 enable_page_index: false,
                 enable_bloom_filter: false,
                 enable_row_group_stats_pruning: false,
+                static_predicate_pruning: true,
                 coerce_int96: None,
                 max_predicate_cache_size: None,
                 max_in_list_size: MAX_IN_LIST_SIZE,
@@ -2581,6 +2636,12 @@ mod test {
         /// Enable row group stats pruning.
         fn with_row_group_stats_pruning(mut self, enable: bool) -> Self {
             self.enable_row_group_stats_pruning = enable;
+            self
+        }
+
+        /// Enable pruning with the static conjuncts of the predicate.
+        fn with_static_predicate_pruning(mut self, enable: bool) -> Self {
+            self.static_predicate_pruning = enable;
             self
         }
 
@@ -2725,6 +2786,7 @@ mod test {
                 enable_page_index: self.enable_page_index,
                 enable_bloom_filter: self.enable_bloom_filter,
                 enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
+                static_predicate_pruning: self.static_predicate_pruning,
                 coerce_int96: self.coerce_int96,
                 // End-to-end coercion behavior (including timezone) is
                 // covered by parquet.slt. No opener-level test currently
@@ -3389,6 +3451,99 @@ mod test {
         // Statistics keep both row groups; their Bloom filters prune both.
         assert_eq!(morsels(col("a").eq(lit(1))).await, 0);
         assert_eq!(morsels(col("a").eq(lit(2))).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_static_predicate_pruning() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batches = vec![
+            record_batch!(("a", Int32, vec![0, 2, 4])).unwrap(),
+            record_batch!(("a", Int32, vec![10, 12, 14])).unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .set_bloom_filter_enabled(true)
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let data_size = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            batches,
+            Some(props),
+        )
+        .await;
+        let file = PartitionedFile::new("test.parquet".to_string(), data_size as u64);
+
+        // The predicate is not pushed down, so the scan returns all rows of the
+        // row groups that are not pruned (three per row group).
+        let rows = |predicate: Arc<dyn PhysicalExpr>, static_predicate_pruning| {
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_predicate(predicate)
+                .with_row_group_stats_pruning(true)
+                .with_enable_bloom_filter(true)
+                .with_static_predicate_pruning(static_predicate_pruning)
+                .build();
+            let file = file.clone();
+            async move {
+                let stream = open_file(&morselizer, file).await.unwrap();
+                count_batches_and_rows(stream).await.1
+            }
+        };
+
+        let gt_five = logical2physical(&col("a").gt(lit(5)), &schema);
+        // Statistics prune the first row group.
+        assert_eq!(rows(Arc::clone(&gt_five), true).await, 3);
+        // Without static predicate pruning, statistics do not use the predicate.
+        assert_eq!(rows(Arc::clone(&gt_five), false).await, 6);
+        // Dynamic filters are still used.
+        assert_eq!(rows(make_dynamic_expr(gt_five), false).await, 3);
+        // Bloom filters still use the static predicate: no row group contains 1.
+        let eq_one = logical2physical(&col("a").eq(lit(1)), &schema);
+        assert_eq!(rows(eq_one, false).await, 0);
+    }
+
+    #[test]
+    fn test_dynamic_conjuncts() {
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let static_expr = logical2physical(&col("a").eq(lit(1)), &schema);
+        let dynamic_expr =
+            make_dynamic_expr(logical2physical(&col("b").eq(lit(2)), &schema));
+
+        // Only the conjuncts with dynamic filters remain.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&static_expr),
+            Operator::And,
+            Arc::clone(&dynamic_expr),
+        ));
+        let result = dynamic_conjuncts(&predicate).unwrap();
+        assert_eq!(result.to_string(), dynamic_expr.to_string());
+
+        // A conjunct with a nested dynamic filter is kept as a whole.
+        let nested: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&static_expr),
+            Operator::Or,
+            Arc::clone(&dynamic_expr),
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::clone(&static_expr),
+            Operator::And,
+            Arc::clone(&nested),
+        ));
+        let result = dynamic_conjuncts(&predicate).unwrap();
+        assert_eq!(result.to_string(), nested.to_string());
+
+        // Without dynamic filters, nothing remains.
+        assert!(dynamic_conjuncts(&static_expr).is_none());
     }
 
     #[tokio::test]
