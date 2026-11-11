@@ -283,9 +283,22 @@ impl PagePruningAccessPlanFilter {
 
         // for each row group specified in the access plan
         let row_group_indexes = access_plan.row_group_indexes();
-        // Page index sets, reused across row groups
-        let mut matched_pages_in_group: HashSet<usize> = HashSet::new();
-        let mut matched_pages_indexes: HashSet<usize> = HashSet::new();
+        // Evaluate each predicate once for the pages of all row groups that are not
+        // fully matched, instead of once per row group.
+        let pruned_row_groups = row_group_indexes
+            .iter()
+            .copied()
+            .filter(|&idx| !access_plan.is_fully_matched(idx))
+            .collect::<Vec<_>>();
+        let pruned_pages = prune_pages_in_row_groups(
+            &pruned_row_groups,
+            page_index_predicates,
+            arrow_schema,
+            parquet_schema,
+            parquet_metadata,
+            file_metrics,
+        );
+        let mut pruned_pages = pruned_row_groups.into_iter().zip(pruned_pages);
         for row_group_index in row_group_indexes {
             // Skip page pruning for fully matched row groups: all rows are
             // known to satisfy the predicate, so page-level pruning is wasted work.
@@ -300,56 +313,16 @@ impl PagePruningAccessPlanFilter {
 
                 continue;
             }
-            // The selection for this particular row group
-            let mut overall_selection = None;
-
-            let total_pages_in_group = parquet_metadata
-                .page_index()
-                .and_then(|page_index| page_index.offset_index(row_group_index, 0))
-                .map_or(0, |offset_index| offset_index.page_locations().len());
-            // stores the indexes of the matched pages
-            matched_pages_in_group.clear();
-            matched_pages_in_group.extend(0..total_pages_in_group);
-
-            for predicate in page_index_predicates {
-                let selection = prune_pages_for_predicate(
-                    row_group_index,
-                    predicate,
-                    arrow_schema,
-                    parquet_schema,
-                    parquet_metadata,
-                    file_metrics,
-                );
-
-                let Some((selection, pages)) = selection else {
-                    trace!("No pages pruned in prune_pages_in_one_row_group");
-                    continue;
-                };
-
-                debug!(
-                    "Use filter and page index to create RowSelection {:?} from predicate: {:?}",
-                    selection,
-                    predicate.predicate_expr(),
-                );
-
-                matched_pages_indexes.clear();
-                matched_pages_indexes
-                    .extend(pages.into_iter().enumerate().filter(|x| x.1).map(|x| x.0));
-                matched_pages_in_group.retain(|x| matched_pages_indexes.contains(x));
-
-                overall_selection = update_selection(overall_selection, selection);
-
-                // if the overall selection has ruled out all rows, no need to
-                // continue with the other predicates
-                let selects_any = overall_selection
-                    .as_ref()
-                    .map(|selection| selection.selects_any())
-                    .unwrap_or(true);
-
-                if !selects_any {
-                    break;
-                }
-            }
+            let (
+                pruned_row_group,
+                RowGroupPages {
+                    overall_selection,
+                    matched_pages,
+                },
+            ) = pruned_pages
+                .next()
+                .expect("a pruning result for every row group that is not fully matched");
+            debug_assert_eq!(pruned_row_group, row_group_index);
 
             if let Some(overall_selection) = overall_selection {
                 let rows_selected = overall_selection.row_count();
@@ -425,9 +398,9 @@ impl PagePruningAccessPlanFilter {
                 }
             }
 
-            let pages_matched = matched_pages_in_group.len();
+            let pages_matched = matched_pages.iter().filter(|matched| **matched).count();
             total_pages_select += pages_matched;
-            total_pages_skip += total_pages_in_group - pages_matched;
+            total_pages_skip += matched_pages.len() - pages_matched;
         }
 
         file_metrics.page_index_rows_pruned.add_pruned(total_skip);
@@ -594,6 +567,177 @@ fn fully_matched_page_count(
         .map_or(0, |offset_index| offset_index.page_locations().len())
 }
 
+/// The result of pruning the pages of a row group with all predicates.
+struct RowGroupPages {
+    /// The intersection of the selections of all predicates, or `None` if no
+    /// predicate could be evaluated.
+    overall_selection: Option<RowSelection>,
+    /// Whether each page (of the first column) may match all predicates.
+    matched_pages: Vec<bool>,
+}
+
+/// Prunes the pages of the given row groups with all `predicates`.
+///
+/// Each predicate is evaluated once for the pages of all row groups whose
+/// selection is not empty yet.
+fn prune_pages_in_row_groups(
+    row_groups: &[usize],
+    predicates: &[PruningPredicate],
+    arrow_schema: &Schema,
+    parquet_schema: &SchemaDescriptor,
+    parquet_metadata: &ParquetMetaData,
+    metrics: &ParquetFileMetrics,
+) -> Vec<RowGroupPages> {
+    let mut results = row_groups
+        .iter()
+        .map(|&row_group_index| {
+            let total_pages_in_group = parquet_metadata
+                .page_index()
+                .and_then(|page_index| page_index.offset_index(row_group_index, 0))
+                .map_or(0, |offset_index| offset_index.page_locations().len());
+            RowGroupPages {
+                overall_selection: None,
+                matched_pages: vec![true; total_pages_in_group],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for predicate in predicates {
+        // If the overall selection of a row group has ruled out all rows, there is
+        // no need to evaluate the other predicates for it.
+        let positions = (0..results.len())
+            .filter(|&position| {
+                results[position]
+                    .overall_selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.selects_any())
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            break;
+        }
+        let predicate_row_groups = positions
+            .iter()
+            .map(|&position| row_groups[position])
+            .collect::<Vec<_>>();
+        let selections = prune_pages_for_predicate_in_row_groups(
+            &predicate_row_groups,
+            predicate,
+            arrow_schema,
+            parquet_schema,
+            parquet_metadata,
+            metrics,
+        );
+
+        for (position, selection) in positions.into_iter().zip(selections) {
+            let Some((selection, pages)) = selection else {
+                trace!("No pages pruned in prune_pages_in_one_row_group");
+                continue;
+            };
+
+            debug!(
+                "Use filter and page index to create RowSelection {:?} from predicate: {:?}",
+                selection,
+                predicate.predicate_expr(),
+            );
+
+            let result = &mut results[position];
+            for (page, matched) in result.matched_pages.iter_mut().enumerate() {
+                *matched &= pages.get(page).copied().unwrap_or(false);
+            }
+            result.overall_selection =
+                update_selection(result.overall_selection.take(), selection);
+        }
+    }
+    results
+}
+
+/// Like [`prune_pages_for_predicate`] for several row groups. The predicate is
+/// evaluated once for the pages of all row groups. Falls back to pruning each row
+/// group on its own if the page index of some row group is incomplete.
+fn prune_pages_for_predicate_in_row_groups(
+    row_groups: &[usize],
+    predicate: &PruningPredicate,
+    arrow_schema: &Schema,
+    parquet_schema: &SchemaDescriptor,
+    parquet_metadata: &ParquetMetaData,
+    metrics: &ParquetFileMetrics,
+) -> Vec<Option<(RowSelection, Vec<bool>)>> {
+    #[cfg(test)]
+    tests::PAGE_PREDICATE_CALLS.set(tests::PAGE_PREDICATE_CALLS.get() + row_groups.len());
+
+    let Some(column) = predicate.required_columns().single_column() else {
+        return vec![None; row_groups.len()];
+    };
+    let create_converter = || match StatisticsConverter::try_new(
+        column.name(),
+        arrow_schema,
+        parquet_schema,
+    ) {
+        Ok(converter) => Some(converter),
+        Err(e) => {
+            debug!(
+                "Could not create statistics converter for column {}: {e}",
+                column.name()
+            );
+            None
+        }
+    };
+    let Some(converter) = create_converter() else {
+        return vec![None; row_groups.len()];
+    };
+
+    let Some(pruning_stats) = MultiRowGroupPagesPruningStatistics::try_new(
+        row_groups,
+        converter,
+        parquet_metadata,
+    ) else {
+        return row_groups
+            .iter()
+            .map(|&row_group_index| {
+                prune_pages_in_one_row_group(
+                    row_group_index,
+                    predicate,
+                    create_converter()?,
+                    parquet_metadata,
+                    metrics,
+                )
+            })
+            .collect();
+    };
+
+    let values = match predicate.prune(&pruning_stats) {
+        Ok(values) => values,
+        Err(e) => {
+            debug!("Error evaluating page index predicate values {e}");
+            metrics.predicate_evaluation_errors.add(row_groups.len());
+            return vec![None; row_groups.len()];
+        }
+    };
+
+    let mut offset = 0;
+    pruning_stats
+        .row_groups
+        .iter()
+        .map(|row_group| {
+            let num_pages = row_group.page_offsets.len();
+            let values = &values[offset..offset + num_pages];
+            offset += num_pages;
+            let Some(page_row_counts) =
+                page_row_counts(row_group.num_rows, row_group.page_offsets)
+            else {
+                debug!(
+                    "Can not determine page row counts for row group {}, skipping",
+                    row_group.row_group_index
+                );
+                metrics.predicate_evaluation_errors.add(1);
+                return None;
+            };
+            Some((row_selection(values, &page_row_counts), values.to_vec()))
+        })
+        .collect()
+}
+
 fn prune_pages_for_predicate(
     row_group_index: usize,
     predicate: &PruningPredicate,
@@ -667,14 +811,20 @@ fn prune_pages_in_one_row_group(
         return None;
     };
 
-    let mut vec = Vec::with_capacity(values.len());
-    assert_eq!(page_row_counts.len(), values.len());
-    let mut sum_row = *page_row_counts.first().unwrap();
-    let mut selected = *values.first().unwrap();
     trace!("Pruned to {values:?} using {pruning_stats:?}");
+    Some((row_selection(&values, &page_row_counts), values))
+}
+
+/// Creates a [`RowSelection`] from whether each page may match (`values`) and the
+/// number of rows of each page.
+fn row_selection(values: &[bool], page_row_counts: &[usize]) -> RowSelection {
+    assert_eq!(page_row_counts.len(), values.len());
+    let mut vec = Vec::with_capacity(values.len());
+    let mut sum_row = page_row_counts[0];
+    let mut selected = values[0];
     for (i, &f) in values.iter().enumerate().skip(1) {
         if f == selected {
-            sum_row += *page_row_counts.get(i).unwrap();
+            sum_row += page_row_counts[i];
         } else {
             let selector = if selected {
                 RowSelector::select(sum_row)
@@ -682,7 +832,7 @@ fn prune_pages_in_one_row_group(
                 RowSelector::skip(sum_row)
             };
             vec.push(selector);
-            sum_row = *page_row_counts.get(i).unwrap();
+            sum_row = page_row_counts[i];
             selected = f;
         }
     }
@@ -693,8 +843,19 @@ fn prune_pages_in_one_row_group(
         RowSelector::skip(sum_row)
     };
     vec.push(selector);
+    RowSelection::from(vec)
+}
 
-    Some((RowSelection::from(vec), values))
+/// Returns the number of rows of each page of a row group with `num_rows` rows.
+fn page_row_counts(num_rows: usize, page_offsets: &[PageLocation]) -> Option<Vec<usize>> {
+    let mut vec = Vec::with_capacity(page_offsets.len());
+    page_offsets.windows(2).for_each(|x| {
+        let start = x[0].first_row_index as usize;
+        let end = x[1].first_row_index as usize;
+        vec.push(end - start);
+    });
+    vec.push(num_rows - page_offsets.last()?.first_row_index as usize);
+    Some(vec)
 }
 
 /// Implement [`PruningStatistics`] for one column's [`PageIndexProvider`]
@@ -768,17 +929,7 @@ impl<'a> PagesPruningStatistics<'a> {
             // fail fast/panic if row_group_index is out of bounds
             .unwrap();
 
-        let num_rows_in_row_group = row_group_metadata.num_rows() as usize;
-
-        let page_offsets = self.page_offsets;
-        let mut vec = Vec::with_capacity(page_offsets.len());
-        page_offsets.windows(2).for_each(|x| {
-            let start = x[0].first_row_index as usize;
-            let end = x[1].first_row_index as usize;
-            vec.push(end - start);
-        });
-        vec.push(num_rows_in_row_group - page_offsets.last()?.first_row_index as usize);
-        Some(vec)
+        page_row_counts(row_group_metadata.num_rows() as usize, self.page_offsets)
     }
 }
 impl PruningStatistics for PagesPruningStatistics<'_> {
@@ -843,6 +994,139 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
                 None
             }
         }
+    }
+
+    fn contained(
+        &self,
+        _column: &datafusion_common::Column,
+        _values: &HashSet<ScalarValue>,
+    ) -> Option<BooleanArray> {
+        None
+    }
+}
+
+/// The pages of one row group in [`MultiRowGroupPagesPruningStatistics`].
+#[derive(Debug)]
+struct RowGroupPageOffsets<'a> {
+    row_group_index: usize,
+    num_rows: usize,
+    page_offsets: &'a [PageLocation],
+}
+
+/// Implements [`PruningStatistics`] for one column's [`PageIndexProvider`] in
+/// several row groups. Each page is one container; the pages are ordered by row
+/// group.
+#[derive(Debug)]
+struct MultiRowGroupPagesPruningStatistics<'a> {
+    row_group_indexes: &'a [usize],
+    row_groups: Vec<RowGroupPageOffsets<'a>>,
+    row_group_metadatas: &'a [RowGroupMetaData],
+    converter: StatisticsConverter<'a>,
+    page_index: &'a dyn PageIndexProvider,
+    num_pages: usize,
+    trusted_min_max: bool,
+}
+
+impl<'a> MultiRowGroupPagesPruningStatistics<'a> {
+    /// Creates a new [`MultiRowGroupPagesPruningStatistics`] for a column in the
+    /// given row groups.
+    ///
+    /// Returns None if the `parquet_metadata` does not have sufficient
+    /// information for all row groups.
+    fn try_new(
+        row_group_indexes: &'a [usize],
+        converter: StatisticsConverter<'a>,
+        parquet_metadata: &'a ParquetMetaData,
+    ) -> Option<Self> {
+        let parquet_column_index = converter.parquet_column_index()?;
+        let page_index: &dyn PageIndexProvider = parquet_metadata.page_index()?.as_ref();
+        if !page_index.is_complete() {
+            return None;
+        }
+        let row_group_metadatas = parquet_metadata.row_groups();
+
+        let row_groups = row_group_indexes
+            .iter()
+            .map(|&row_group_index| {
+                let page_offsets = page_index
+                    .offset_index(row_group_index, parquet_column_index)?
+                    .page_locations();
+                Some(RowGroupPageOffsets {
+                    row_group_index,
+                    num_rows: row_group_metadatas.get(row_group_index)?.num_rows()
+                        as usize,
+                    page_offsets,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let num_pages = row_groups
+            .iter()
+            .map(|row_group| row_group.page_offsets.len())
+            .sum();
+
+        let file_metadata = parquet_metadata.file_metadata();
+        let trusted_min_max = !has_untrusted_min_max_order(
+            file_metadata.schema_descr(),
+            file_metadata.column_orders().map(Vec::as_slice),
+            parquet_column_index,
+        );
+
+        Some(Self {
+            row_group_indexes,
+            row_groups,
+            row_group_metadatas,
+            converter,
+            page_index,
+            num_pages,
+            trusted_min_max,
+        })
+    }
+}
+
+impl PruningStatistics for MultiRowGroupPagesPruningStatistics<'_> {
+    fn min_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        if !self.trusted_min_max {
+            return None;
+        }
+        self.converter
+            .data_page_mins(self.page_index, self.row_group_indexes)
+            .inspect_err(|e| debug!("Error evaluating data page min values {e}"))
+            .ok()
+    }
+
+    fn max_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        if !self.trusted_min_max {
+            return None;
+        }
+        self.converter
+            .data_page_maxes(self.page_index, self.row_group_indexes)
+            .inspect_err(|e| debug!("Error evaluating data page max values {e}"))
+            .ok()
+    }
+
+    fn num_containers(&self) -> usize {
+        self.num_pages
+    }
+
+    fn null_counts(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        self.converter
+            .data_page_null_counts(self.page_index, self.row_group_indexes)
+            .inspect_err(|e| debug!("Error evaluating data page null counts {e}"))
+            .ok()
+            .map(|null_counts| Arc::new(null_counts) as ArrayRef)
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        self.converter
+            .data_page_row_counts(
+                self.page_index,
+                self.row_group_metadatas,
+                self.row_group_indexes,
+            )
+            .inspect_err(|e| debug!("Error evaluating data page row counts {e}"))
+            .ok()
+            .flatten()
+            .map(|row_counts| Arc::new(row_counts) as ArrayRef)
     }
 
     fn contained(
