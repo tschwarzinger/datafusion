@@ -18,12 +18,13 @@ use parking_lot::Mutex;
 /// whole, and a scan that needs more I/O concurrency can use budget other
 /// scans leave idle.
 ///
-/// The budget only gates *starting* additional I/O: a scan with nothing in
-/// flight and nothing being decoded may always start one I/O, even when the
-/// budget is exhausted by other scans. This guarantees progress (and that no
-/// scan is slower than with no prefetch at all) when other scans hold budget
-/// but are not being polled, e.g. the probe side of a join while its build
-/// side is collected.
+/// The budget only limits prefetch *beyond* a guaranteed minimum: each
+/// partition of a scan may always have one unit of work (an I/O in flight, or
+/// fetched data being decoded), as it does without a budget, even when the
+/// budget is exhausted or smaller than a single I/O. So a scan is never slower
+/// than with no prefetch at all, makes progress when other scans hold budget
+/// but are not being polled (e.g. the probe side of a join while its build
+/// side is collected), and I/O larger than the budget still runs.
 ///
 /// [`TaskContext::io_budget`]: crate::TaskContext::io_budget
 pub struct IoBudget {

@@ -40,8 +40,10 @@ pub(super) use super::work_pool::ReadOrder;
 /// bytes of in-flight I/O + bytes buffered in ready morsels and readers <= budget
 /// ```
 ///
-/// At least one I/O is always allowed when nothing is in flight or being
-/// read, so a single item larger than the budget still makes progress. I/O
+/// Regardless of the budget, each stream sharing a pool may have one unit of
+/// work (an I/O in flight, or a morsel ready or being read), as without a
+/// budget: a small budget is never slower than none, and items larger than
+/// the budget still make progress. I/O
 /// futures are lazy and only started once they fit the budget. Started I/O is
 /// spawned onto the Tokio runtime (when available) so it makes progress while
 /// streams decode. The budget is shared by all scans of the query (see
@@ -197,7 +199,7 @@ impl ScanState {
             {
                 return ret;
             }
-            if guard.start_io(&pool, reading) {
+            if guard.start_io(&pool) {
                 return ScanAndReturn::Continue;
             }
             if let Some((unit, planner)) = guard.take_planner(reading) {

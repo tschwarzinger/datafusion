@@ -1718,6 +1718,51 @@ mod tests {
         Ok(())
     }
 
+    /// However small the budget, a scan keeps at least one unit of work in
+    /// flight per partition, like it does without a budget: a budget smaller
+    /// than a row group must not serialize the I/O of all partitions sharing
+    /// a pool (which would be slower than no budget at all).
+    #[tokio::test]
+    async fn morsel_io_budget_floor_is_one_io_per_partition() -> Result<()> {
+        let file = |name: &str, io: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(io),
+                    PollsToResolve(5),
+                    100,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(io), batch))
+                .return_none()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_file_in_partition(PartitionId(0), file("file1.parquet", 1, 41))
+            .with_file_in_partition(PartitionId(1), file("file2.parquet", 2, 42));
+        // far smaller than any I/O
+        let budget = datafusion_execution::IoBudget::new(1);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut streams = test.build_streams(&metrics, &budget)?;
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for stream in &mut streams {
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+        }
+        assert_eq!(
+            budget.reserved(),
+            200,
+            "both partitions must have their I/O in flight"
+        );
+
+        let mut batches = 0;
+        for stream in &mut streams {
+            while let Some(batch) = stream.next().await {
+                batch?;
+                batches += 1;
+            }
+        }
+        assert_eq!(batches, 2);
+        assert_eq!(budget.reserved(), 0);
+        Ok(())
+    }
+
     /// Dropping a scan early (e.g. LIMIT above it, cancellation) returns its
     /// reservations to the query-wide budget.
     #[tokio::test]

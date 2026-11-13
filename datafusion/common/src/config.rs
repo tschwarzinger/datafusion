@@ -1141,9 +1141,10 @@ config_namespace! {
         /// non-zero value, scans issue further I/O (the next row groups of a
         /// Parquet file, further files) while they decode, as long as the bytes
         /// of in-flight I/O plus fetched-but-not-yet-decoded data of the whole
-        /// query stay within this budget. A scan with nothing in flight may
-        /// always start one I/O, so a scan never waits for budget held by
-        /// another scan. Scans that do not need to preserve order also split
+        /// query stay within this budget. Each scan partition may always have
+        /// one I/O in flight, as without a budget, so a small budget is never
+        /// slower than none and a scan never waits for budget held by another
+        /// scan. Scans that do not need to preserve order also split
         /// files into independently fetched units (for Parquet: one per row
         /// group), so a partition can fetch several row groups of a file
         /// concurrently and idle partitions can take over work of busy ones.

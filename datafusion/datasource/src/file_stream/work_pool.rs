@@ -318,7 +318,7 @@ impl WorkPool {
     ///
     /// With `reserve`, the bytes are reserved from the query-wide budget if
     /// the I/O may start.
-    fn admit_io(&self, stream_reading: bool, reserve: bool) -> bool {
+    fn admit_io(&self, reserve: bool) -> bool {
         let Some((_, pending)) = self.unstarted_io.front() else {
             return false;
         };
@@ -327,14 +327,18 @@ impl WorkPool {
             return self.in_flight.is_empty();
         };
         let bytes = pending.io_bytes().unwrap_or(0);
-        // Always allow one I/O when this scan has nothing in flight or being
-        // read, so a scan makes progress even if other scans of the query hold
-        // the whole budget, and an item larger than the budget still runs.
-        let nothing_running = self.in_flight.is_empty()
-            && self.active_readers == 0
-            && !stream_reading
-            && self.eligible_morsel_index().is_none();
-        if nothing_running {
+        // Guaranteed minimum, regardless of the budget: one unit of work (an
+        // I/O in flight, a morsel ready to read, or a morsel being read) per
+        // stream driving this pool. That is what a scan does without a budget
+        // (each partition alternates between one I/O and decoding), so the
+        // budget only limits prefetch *beyond* that and a small budget is
+        // never slower than none. It also guarantees progress when other scans
+        // of the query hold the whole budget, and lets items larger than the
+        // budget run. A stream's own reader is counted in `active_readers`.
+        let below_floor =
+            self.in_flight.len() + self.active_readers + self.eligible_morsel_count()
+                < self.config.streams.max(1);
+        if below_floor {
             if reserve {
                 budget.force_reserve(bytes);
             }
@@ -347,14 +351,14 @@ impl WorkPool {
         }
     }
 
-    fn can_start_io(&self, stream_reading: bool) -> bool {
-        self.admit_io(stream_reading, false)
+    fn can_start_io(&self) -> bool {
+        self.admit_io(false)
     }
 
     /// Start I/O as allowed by the budget. Returns true if any I/O was started.
-    pub(super) fn start_io(&mut self, this: &SharedPool, stream_reading: bool) -> bool {
+    pub(super) fn start_io(&mut self, this: &SharedPool) -> bool {
         let mut started = false;
-        while self.admit_io(stream_reading, true) {
+        while self.admit_io(true) {
             let (unit, pending) = self.unstarted_io.pop_front().expect("front");
             let bytes = pending.io_bytes();
             match bytes {
@@ -492,8 +496,22 @@ impl WorkPool {
             return true;
         }
         let streams = self.config.streams.max(1);
-        !self.legacy()
-            && self.units.len() < MAX_OPEN_UNITS_PER_STREAM * streams
+        if self.legacy() {
+            return false;
+        }
+        // Guaranteed minimum, regardless of the budget (see `admit_io`): each
+        // stream may have one item of work, like each partition opens its own
+        // file without a budget.
+        let work_items = self.in_flight.len()
+            + self.active_readers
+            + self.ready_morsels.len()
+            + self.unstarted_io.len()
+            + self.ready_planners.len()
+            + self.planning;
+        if work_items < streams {
+            return true;
+        }
+        self.units.len() < MAX_OPEN_UNITS_PER_STREAM * streams
             // budget is not already saturated
             && self.unstarted_io.is_empty()
             && self.ready_planners.is_empty()
@@ -548,6 +566,21 @@ impl WorkPool {
     // ---------------------------------------------------------------
     // Reading
     // ---------------------------------------------------------------
+
+    /// Number of ready morsels that may be read next (all of them, or for
+    /// ordered reads only those of the next unit to read).
+    fn eligible_morsel_count(&self) -> usize {
+        match self.config.read_order {
+            ReadOrder::Any => self.ready_morsels.len(),
+            _ => match self.eligible_morsel_index() {
+                Some(idx) => {
+                    let unit = self.ready_morsels[idx].unit;
+                    self.ready_morsels.iter().filter(|m| m.unit == unit).count()
+                }
+                None => 0,
+            },
+        }
+    }
 
     /// Index of the next morsel that may be read.
     fn eligible_morsel_index(&self) -> Option<usize> {
@@ -616,7 +649,7 @@ impl WorkPool {
     pub(super) fn has_ready_work(&self, stream_reading: bool) -> bool {
         !self.completed.is_empty()
             || self.can_plan(stream_reading)
-            || self.can_start_io(stream_reading)
+            || self.can_start_io()
             || (!stream_reading && self.eligible_morsel_index().is_some())
     }
 }
