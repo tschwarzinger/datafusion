@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::scan_state::{ReadOrder, ScanState};
+use crate::file_stream::work_pool::PoolConfig;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
@@ -147,18 +148,18 @@ impl<'a> FileStreamBuilder<'a> {
         };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
-        let scan_state = Box::new(
-            ScanState::new(
-                work_source,
-                config.limit,
-                morselizer,
-                on_error,
-                file_stream_metrics,
-            )
-            .with_io_budget(io_budget_bytes)
-            .with_read_order(read_order)
-            .with_may_donate(split),
-        );
+        let scan_state = Box::new(ScanState::new(
+            work_source,
+            config.limit,
+            morselizer,
+            on_error,
+            file_stream_metrics,
+            PoolConfig {
+                io_budget: io_budget_bytes,
+                read_order,
+                streams: config.file_groups.len(),
+            },
+        ));
 
         Ok(FileStream {
             projected_schema,

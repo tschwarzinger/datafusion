@@ -11,6 +11,7 @@
 mod builder;
 mod metrics;
 mod scan_state;
+mod work_pool;
 pub(crate) mod work_source;
 
 use std::pin::Pin;
@@ -1608,6 +1609,79 @@ mod tests {
         Ok(())
     }
 
+    /// A stream polled while the queue of unopened files is empty, but a
+    /// sibling's I/O is still in flight, must not finish: the work stays in
+    /// the shared pool until it is done, and any stream may read it.
+    #[tokio::test]
+    async fn morsel_idle_sibling_waits_for_in_flight_work() -> Result<()> {
+        let child = |name: &str, morsel: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(morsel),
+                    PollsToResolve(3),
+                    10,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(morsel), batch))
+                .return_none()
+                .into()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_file_in_partition(
+                PartitionId(0),
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(
+                        MockPlanBuilder::new().with_ready_planners(
+                            (0..4)
+                                .map(|i| child(&format!("rg{i}"), 10 + i, 41 + i as i32))
+                                .collect(),
+                        ),
+                    )
+                    .return_none(),
+            )
+            .with_file_in_partition(
+                PartitionId(1),
+                MockPlanner::builder("file2.parquet").return_none(),
+            )
+            .with_io_budget_bytes(1000);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut streams = test.build_streams(&metrics)?;
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+
+        // Partition 0 opens file1, splits it and starts all row group I/O.
+        // Partition 1 opens (empty) file2. Afterwards no unopened file is
+        // left, but the row group I/O is still in flight.
+        for _ in 0..2 {
+            for stream in &mut streams {
+                assert!(stream.poll_next_unpin(&mut cx).is_pending());
+            }
+        }
+
+        // Read both partitions concurrently until done.
+        let mut outputs = vec![vec![]; 2];
+        let mut done = [false; 2];
+        while !done.iter().all(|d| *d) {
+            for (p, stream) in streams.iter_mut().enumerate() {
+                if done[p] {
+                    continue;
+                }
+                match futures::poll!(stream.next()) {
+                    std::task::Poll::Ready(Some(batch)) => outputs[p]
+                        .push(batch?.column(0).as_primitive::<Int32Type>().value(0)),
+                    std::task::Poll::Ready(None) => done[p] = true,
+                    std::task::Poll::Pending => tokio::task::yield_now().await,
+                }
+            }
+        }
+        let mut all: Vec<_> = outputs.concat();
+        all.sort_unstable();
+        assert_eq!(all, vec![41, 42, 43, 44]);
+        assert!(
+            !outputs[1].is_empty(),
+            "partition 1 should read row groups of partition 0's file: {outputs:?}"
+        );
+        Ok(())
+    }
+
     /// Tests how one or more `FileStream`s consume morselized file work.
     #[derive(Clone)]
     struct FileStreamMorselTest {
@@ -1859,6 +1933,33 @@ mod tests {
 
         /// Returns the number of configured partitions, including empty ones
         /// that appear only in the explicit read schedule.
+        /// Build one stream per partition, sharing work like
+        /// `DataSourceExec::execute` does.
+        fn build_streams(
+            &self,
+            metrics_set: &ExecutionPlanMetricsSet,
+        ) -> Result<Vec<FileStream>> {
+            let config = self.test_config();
+            let mut options = ConfigOptions::default();
+            options.execution.enable_file_stream_work_stealing =
+                self.enable_file_stream_work_stealing;
+            let shared_work_source =
+                config.create_sibling_state(&options).and_then(|state| {
+                    state.as_ref().downcast_ref::<SharedWorkSource>().cloned()
+                });
+            (0..self.num_partitions())
+                .map(|partition| {
+                    FileStreamBuilder::new(&config)
+                        .with_partition(partition)
+                        .with_shared_work_source(shared_work_source.clone())
+                        .with_io_budget_bytes(self.io_budget_bytes)
+                        .with_morselizer(Box::new(self.morselizer.clone()))
+                        .with_metrics(metrics_set)
+                        .build()
+                })
+                .collect()
+        }
+
         fn num_partitions(&self) -> usize {
             self.partition_files
                 .keys()
