@@ -3,14 +3,16 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::PartitionedFile;
 use crate::file_groups::FileGroup;
 use crate::file_scan_config::FileScanConfig;
 use parking_lot::Mutex;
 
-/// Source of work for `ScanState`.
+use super::work_pool::{PoolConfig, SharedPool, WorkPool};
+
+/// Source of unopened files for `ScanState`.
 ///
 /// Streams that may share work across siblings use [`WorkSource::Shared`],
 /// while streams that can not share work (e.g. because they must preserve file
@@ -24,11 +26,19 @@ pub(super) enum WorkSource {
 }
 
 impl WorkSource {
-    /// Pop the next file to plan from this work source.
+    /// Pop the next unopened file.
     pub(super) fn pop_front(&mut self) -> Option<PartitionedFile> {
         match self {
             Self::Local(files) => files.pop_front(),
             Self::Shared(shared) => shared.pop_front(),
+        }
+    }
+
+    /// Return the shared work source, if any.
+    pub(super) fn shared(&self) -> Option<&SharedWorkSource> {
+        match self {
+            Self::Local(_) => None,
+            Self::Shared(shared) => Some(shared),
         }
     }
 
@@ -48,6 +58,10 @@ impl WorkSource {
 /// sibling streams for that execution. Whichever stream becomes idle first may
 /// take the next unopened file from the front of the queue.
 ///
+/// When the scan has an I/O budget, the siblings additionally share one
+/// [`WorkPool`] holding all work that was opened but not yet read (planners,
+/// in-flight I/O, fetched morsels), so any stream can drive any of it.
+///
 /// It uses a [`Mutex`] internally to provide thread-safe access
 /// to the shared file queue.
 #[derive(Debug, Clone)]
@@ -55,18 +69,29 @@ pub(crate) struct SharedWorkSource {
     inner: Arc<SharedWorkSourceInner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct SharedWorkSourceInner {
     files: Mutex<VecDeque<PartitionedFile>>,
+    /// Work pool shared by all siblings (budgeted scans only).
+    pool: OnceLock<SharedPool>,
+}
+
+impl std::fmt::Debug for SharedWorkSourceInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedWorkSourceInner")
+            .field("files", &self.files)
+            .field("pool", &self.pool.get().is_some())
+            .finish()
+    }
 }
 
 impl SharedWorkSource {
     /// Create a shared work source containing the provided unopened files.
     pub(crate) fn new(files: impl IntoIterator<Item = PartitionedFile>) -> Self {
-        let files = files.into_iter().collect();
         Self {
             inner: Arc::new(SharedWorkSourceInner {
-                files: Mutex::new(files),
+                files: Mutex::new(files.into_iter().collect()),
+                pool: OnceLock::new(),
             }),
         }
     }
@@ -92,5 +117,10 @@ impl SharedWorkSource {
     /// Returns `None` if the queue is empty
     fn pop_front(&self) -> Option<PartitionedFile> {
         self.inner.files.lock().pop_front()
+    }
+
+    /// The work pool shared by all siblings, created by the first caller.
+    pub(super) fn pool(&self, config: PoolConfig) -> SharedPool {
+        Arc::clone(self.inner.pool.get_or_init(|| WorkPool::new_shared(config)))
     }
 }

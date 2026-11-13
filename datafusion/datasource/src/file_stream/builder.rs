@@ -5,10 +5,12 @@
 use std::sync::Arc;
 
 use crate::file_scan_config::FileScanConfig;
-use crate::file_stream::scan_state::ScanState;
+use crate::file_stream::scan_state::{ReadOrder, ScanState};
+use crate::file_stream::work_pool::PoolConfig;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::IoBudget;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 
 use super::metrics::FileStreamMetrics;
@@ -22,6 +24,8 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    io_budget: Option<Arc<IoBudget>>,
+    split_morsels: bool,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -34,6 +38,8 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            io_budget: None,
+            split_morsels: true,
         }
     }
 
@@ -80,6 +86,23 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Configure the query-wide I/O budget used to prefetch I/O ahead of
+    /// decoding (see [`TaskContext::io_budget`]). Without one (the default),
+    /// at most one I/O is outstanding at a time.
+    ///
+    /// [`TaskContext::io_budget`]: datafusion_execution::TaskContext::io_budget
+    pub fn with_io_budget(mut self, io_budget: Option<Arc<IoBudget>>) -> Self {
+        self.io_budget = io_budget;
+        self
+    }
+
+    /// Configure whether files may be split into independent morsels
+    /// (see `datafusion.execution.scan_split_morsels`).
+    pub fn with_split_morsels(mut self, split_morsels: bool) -> Self {
+        self.split_morsels = split_morsels;
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -89,12 +112,14 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            io_budget,
+            split_morsels,
         } = self;
 
         let Some(partition) = partition else {
             return internal_err!("FileStreamBuilder missing required partition");
         };
-        let Some(morselizer) = morselizer else {
+        let Some(mut morselizer) = morselizer else {
             return internal_err!("FileStreamBuilder missing required morselizer");
         };
         let Some(metrics) = metrics else {
@@ -111,6 +136,19 @@ impl<'a> FileStreamBuilder<'a> {
             None => WorkSource::Local(file_group.into_inner().into()),
         };
 
+        let preserve_order = config.preserves_file_order();
+        let io_budget =
+            io_budget.filter(|budget| budget.is_enabled() && config.limit.is_none());
+        let split = split_morsels && io_budget.is_some() && !preserve_order;
+        morselizer.set_split_files(split);
+        let read_order = if preserve_order {
+            ReadOrder::Required
+        } else if morselizer.prefers_ordered_read() {
+            ReadOrder::Preferred
+        } else {
+            ReadOrder::Any
+        };
+
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);
         let scan_state = Box::new(ScanState::new(
             work_source,
@@ -118,6 +156,11 @@ impl<'a> FileStreamBuilder<'a> {
             morselizer,
             on_error,
             file_stream_metrics,
+            PoolConfig {
+                io_budget,
+                read_order,
+                streams: config.file_groups.len(),
+            },
         ));
 
         Ok(FileStream {

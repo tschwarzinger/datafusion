@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use crate::PartitionedFile;
-use crate::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
+use crate::morsel::{
+    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, PendingMorselPlanner,
+};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
-use futures::stream::BoxStream;
 use futures::{Future, FutureExt};
 
 // Use thin wrappers around usize so the test setups are more explicit
@@ -228,6 +229,8 @@ struct MockPendingPlanner {
     io_future_id: IoFutureId,
     polls_to_resolve: PollsToResolve,
     result: std::result::Result<(), MockError>,
+    /// Optional `PendingMorselPlanner::with_io_bytes` hint.
+    io_bytes: Option<usize>,
 }
 
 /// Builder for one mock `PlannerStep::Plan`.
@@ -277,6 +280,23 @@ impl MockPlanBuilder {
             io_future_id,
             polls_to_resolve,
             result,
+            io_bytes: None,
+        });
+        self
+    }
+
+    /// Add a successful pending planner I/O future that fetches `io_bytes`.
+    pub(crate) fn with_sized_pending_planner(
+        mut self,
+        io_future_id: IoFutureId,
+        polls_to_resolve: PollsToResolve,
+        io_bytes: usize,
+    ) -> Self {
+        self.pending_planner = Some(MockPendingPlanner {
+            io_future_id,
+            polls_to_resolve,
+            result: Ok(()),
+            io_bytes: Some(io_bytes),
         });
         self
     }
@@ -407,6 +427,7 @@ impl MockPlannerBuilder {
 pub(crate) struct MockMorselizer {
     observer: MorselObserver,
     files: HashMap<String, MockPlanner>,
+    prefers_ordered_read: bool,
 }
 
 impl MockMorselizer {
@@ -426,9 +447,19 @@ impl MockMorselizer {
         self.files.insert(planner.file_path.clone(), planner);
         self
     }
+
+    /// Set the [`Morselizer::prefers_ordered_read`] hint.
+    pub(crate) fn with_prefers_ordered_read(mut self, prefers: bool) -> Self {
+        self.prefers_ordered_read = prefers;
+        self
+    }
 }
 
 impl Morselizer for MockMorselizer {
+    fn prefers_ordered_read(&self) -> bool {
+        self.prefers_ordered_read
+    }
+
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         let path = file.object_meta.location.to_string();
         self.observer
@@ -561,6 +592,7 @@ impl MorselPlanner for MockMorselPlanner {
                     io_future_id,
                     polls_to_resolve,
                     result,
+                    io_bytes,
                 }) = pending_planner
                 {
                     observer.push(MorselEvent::IoFutureCreated {
@@ -583,7 +615,11 @@ impl MorselPlanner for MockMorselPlanner {
                         }) as Box<dyn MorselPlanner>)
                     })
                     .boxed();
-                    plan = plan.with_pending_planner(io_future);
+                    let mut pending = PendingMorselPlanner::new(io_future);
+                    if let Some(io_bytes) = io_bytes {
+                        pending = pending.with_io_bytes(io_bytes);
+                    }
+                    plan = plan.with_pending(pending);
                 }
 
                 Ok(Some(plan))
@@ -616,16 +652,16 @@ impl MockMorsel {
 }
 
 impl Morsel for MockMorsel {
-    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
+    fn into_stream(self: Box<Self>) -> Result<MorselStream> {
         self.observer.push(MorselEvent::MorselStreamStarted {
             morsel_id: self.morsel_id,
         });
-        Box::pin(MockMorselStream {
+        Ok(MorselStream::Async(Box::pin(MockMorselStream {
             observer: self.observer.clone(),
             morsel_id: self.morsel_id,
             batch_ids: self.batch_ids.into(),
             finished: false,
-        })
+        })))
     }
 }
 

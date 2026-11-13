@@ -2,32 +2,66 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-use datafusion_common::internal_datafusion_err;
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::morsel::{Morsel, MorselPlanner, Morselizer, PendingMorselPlanner};
+use crate::morsel::{MorselStream, Morselizer};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_physical_plan::metrics::ScopedTimerGuard;
-use futures::stream::BoxStream;
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
 
+use super::work_pool::{PoolConfig, PoolStep, SharedPool, WorkPool};
 use super::work_source::WorkSource;
-use super::{FileStreamMetrics, OnError};
+use super::{FileStreamMetrics, OnError, StartableTime};
+
+pub(super) use super::work_pool::ReadOrder;
 
 /// State [`FileStreamState::Scan`].
 ///
 /// There is one `ScanState` per `FileStream`, and thus per output partition.
 ///
-/// It groups together the lifecycle of scanning that partition's files:
-/// unopened files, CPU-ready planners, pending planner I/O, ready morsels,
-/// the active reader, and the metrics associated with processing that work.
+/// It drives the lifecycle of scanning files: unopened files (from the
+/// [`WorkSource`]), CPU-ready planners, planner I/O, ready morsels and the
+/// active reader. Everything but the active reader lives in a [`WorkPool`],
+/// which is private to this stream, or — for scans with an I/O budget that
+/// share work between partitions — shared with all sibling streams.
 ///
-/// # I/O
+/// # I/O budget
 ///
-/// To avoid challenges controlling buffering, the ScanState only ever has a
-/// single I/O outstanding at any time.
+/// Without an I/O budget (the default), the `ScanState` only ever has a
+/// single I/O outstanding and does not plan new work while a reader is
+/// active, i.e. I/O and decoding strictly alternate.
+///
+/// With a budget, I/O is issued ahead of decoding (the next row
+/// groups of the current file, further files) as long as
+///
+/// ```text
+/// bytes of in-flight I/O + bytes buffered in ready morsels and readers <= budget
+/// ```
+///
+/// At least one I/O is always allowed when nothing is in flight or being
+/// read, so a single item larger than the budget still makes progress. I/O
+/// futures are lazy and only started once they fit the budget. Started I/O is
+/// spawned onto the Tokio runtime (when available) so it makes progress while
+/// streams decode. The budget is shared by all scans of the query (see
+/// [`IoBudget`]).
+///
+/// [`IoBudget`]: datafusion_execution::IoBudget
+///
+/// # Sharing work
+///
+/// With a shared pool, prefetching decides *when* data is fetched, not *who*
+/// reads it: any stream can plan any planner, collect any I/O and read any
+/// fetched morsel, and a stream only finishes when no work is left anywhere
+/// (see [`WorkPool`]). Without this, work one stream claimed to prefetch it
+/// could not be balanced, and the query would wait for the most loaded
+/// stream (observed on local SSD), or a stream could finish while work it
+/// could have taken was still in flight.
+///
+/// # Ordering
+///
+/// See [`ReadOrder`].
 ///
 /// # State Transitions
 ///
@@ -41,15 +75,15 @@ use super::{FileStreamMetrics, OnError};
 /// ready_planners ---> plan() ---> ready_morsels ---> into_stream() ---> reader ---> RecordBatches
 ///       ^               |
 ///       |               v
-///       |          pending_planner
+///       |          pending I/O (budgeted)
 ///       |               |
 ///       |               v
-///       +-------- poll until ready
+///       +-------- I/O completes
 /// ```
 ///
 /// [`FileStreamState::Scan`]: super::FileStreamState::Scan
 pub(super) struct ScanState {
-    /// Unopened files that still need to be planned for this stream.
+    /// Unopened files that still need to be planned.
     work_source: WorkSource,
     /// Remaining row limit, if any.
     remain: Option<usize>,
@@ -57,38 +91,64 @@ pub(super) struct ScanState {
     morselizer: Box<dyn Morselizer>,
     /// Behavior if opening or scanning a file fails.
     on_error: OnError,
-    /// CPU-ready planners for the current file.
-    ready_planners: VecDeque<Box<dyn MorselPlanner>>,
-    /// Ready morsels for the current file.
-    ready_morsels: VecDeque<Box<dyn Morsel>>,
-    /// The active reader, if any.
-    reader: Option<BoxStream<'static, Result<RecordBatch>>>,
-    /// The single planner currently blocked on I/O, if any.
-    ///
-    /// Once the I/O completes, yields the next planner and is pushed back
-    /// onto `ready_planners`.
-    pending_planner: Option<PendingMorselPlanner>,
+    /// Outstanding work (private, or shared with sibling streams).
+    pool: SharedPool,
+    /// The morsel this stream is reading, if any.
+    reader: Option<ActiveReader>,
+    /// Set once the work source has no more files.
+    source_done: bool,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
 }
 
+struct ActiveReader {
+    unit: u64,
+    bytes: usize,
+    stream: MorselStream,
+}
+
+fn start_timer(time: &mut StartableTime) {
+    if time.start.is_none() {
+        time.start();
+    }
+}
+
 impl ScanState {
+    /// Create a new scan state.
+    ///
+    /// The pool is shared with sibling streams when they share a work source,
+    /// the query has an I/O budget and order is not [`ReadOrder::Required`];
+    /// otherwise it is private.
     pub(super) fn new(
         work_source: WorkSource,
         remain: Option<usize>,
         morselizer: Box<dyn Morselizer>,
         on_error: OnError,
         metrics: FileStreamMetrics,
+        mut config: PoolConfig,
     ) -> Self {
+        if remain.is_some() {
+            // avoid reading ahead data that will not be needed
+            config.io_budget = None;
+        }
+        let prefetch = config.io_budget.as_ref().is_some_and(|b| b.is_enabled());
+        let pool = match work_source.shared() {
+            Some(shared) if prefetch && config.read_order != ReadOrder::Required => {
+                shared.pool(config)
+            }
+            _ => WorkPool::new_shared(PoolConfig {
+                streams: 1,
+                ..config
+            }),
+        };
         Self {
             work_source,
             remain,
             morselizer,
             on_error,
-            ready_planners: Default::default(),
-            ready_morsels: Default::default(),
+            pool,
             reader: None,
-            pending_planner: None,
+            source_done: false,
             metrics,
         }
     }
@@ -98,181 +158,199 @@ impl ScanState {
         self.on_error = on_error;
     }
 
+    fn skip_errors(&self) -> bool {
+        matches!(self.on_error, OnError::Skip)
+    }
+
+    fn step_result(step: PoolStep) -> Option<ScanAndReturn> {
+        match step {
+            PoolStep::Progress => Some(ScanAndReturn::Continue),
+            PoolStep::Idle => None,
+            PoolStep::Error(err) => Some(ScanAndReturn::Error(err)),
+        }
+    }
+
     /// Drives one iteration of the active scan state.
     ///
     /// Work is attempted in this order:
-    /// 1. resolve any pending planner I/O
-    /// 2. poll the active reader
-    /// 3. turn a ready morsel into the active reader
-    /// 4. run CPU planning on a ready planner
-    /// 5. morselize the next unopened file
+    /// 1. collect completed planner I/O
+    /// 2. start planner I/O that fits within the I/O budget
+    /// 3. run CPU planning on a ready planner
+    /// 4. poll the active reader
+    /// 5. turn a ready morsel into the active reader
+    /// 6. open the next unopened file
     ///
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
     pub(super) fn poll_scan(&mut self, cx: &mut Context<'_>) -> ScanAndReturn {
-        let _processing_timer: ScopedTimerGuard<'_> =
-            self.metrics.time_processing.timer();
+        let time_processing = self.metrics.time_processing.clone();
+        let _timer: ScopedTimerGuard<'_> = time_processing.timer();
+        let skip_errors = self.skip_errors();
+        let reading = self.reader.is_some();
+        let pool = Arc::clone(&self.pool);
 
-        // Try and resolve outstanding IO first. If it is still pending, check
-        // the current reader or ready morsels before yielding. New planning
-        // work must still wait for this I/O to resolve.
-        if let Some(mut pending_planner) = self.pending_planner.take() {
-            match pending_planner.poll_unpin(cx) {
-                // IO is still pending
-                Poll::Pending => {
-                    self.pending_planner = Some(pending_planner);
-                }
-                // IO resolved, and the planner is ready for CPU work
-                Poll::Ready(Ok(planner)) => {
-                    self.ready_planners.push_back(planner);
-                }
-                // IO Error
-                Poll::Ready(Err(err)) => {
-                    self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    return match self.on_error {
-                        OnError::Skip => {
-                            self.metrics.files_processed.add(1);
-                            ScanAndReturn::Continue
-                        }
-                        OnError::Fail => ScanAndReturn::Error(err),
-                    };
-                }
+        // 1.-3.: I/O and planning
+        {
+            let mut guard = pool.lock();
+            if let Some(ret) =
+                Self::step_result(guard.collect_io(cx, &mut self.metrics, skip_errors))
+            {
+                return ret;
+            }
+            if guard.start_io(&pool, reading) {
+                return ScanAndReturn::Continue;
+            }
+            if let Some((unit, planner)) = guard.take_planner(reading) {
+                drop(guard);
+                // CPU work, outside the lock
+                let result = planner.plan();
+                let step = pool.lock().finish_planning(
+                    unit,
+                    result,
+                    &mut self.metrics,
+                    skip_errors,
+                );
+                return Self::step_result(step).unwrap_or(ScanAndReturn::Continue);
             }
         }
 
-        // Next try and get the next batch from the active reader, if any.
-        if let Some(reader) = self.reader.as_mut() {
-            match reader.poll_next_unpin(cx) {
-                // Morsels should ideally only expose ready-to-decode streams,
-                // but tolerate pending readers here.
-                Poll::Pending => return ScanAndReturn::Return(Poll::Pending),
-                Poll::Ready(Some(Ok(batch))) => {
-                    self.metrics.time_scanning_until_data.stop();
-                    self.metrics.time_scanning_total.stop();
-                    // Apply any remaining row limit.
-                    let (batch, finished) = match &mut self.remain {
-                        Some(remain) => {
-                            if *remain > batch.num_rows() {
-                                *remain -= batch.num_rows();
-                                self.metrics.time_scanning_total.start();
-                                (batch, false)
-                            } else {
-                                let batch = batch.slice(0, *remain);
-                                let done = 1 + self.work_source.skipped_on_limit();
-                                self.metrics.files_processed.add(done);
-                                *remain = 0;
-                                (batch, true)
-                            }
-                        }
-                        None => {
-                            self.metrics.time_scanning_total.start();
-                            (batch, false)
-                        }
-                    };
-                    return if finished {
-                        ScanAndReturn::Done(Some(Ok(batch)))
-                    } else {
-                        ScanAndReturn::Return(Poll::Ready(Some(Ok(batch))))
-                    };
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    self.reader = None;
-                    self.metrics.file_scan_errors.add(1);
-                    self.metrics.time_scanning_until_data.stop();
-                    self.metrics.time_scanning_total.stop();
-                    return match self.on_error {
-                        OnError::Skip => {
-                            self.metrics.files_processed.add(1);
-                            ScanAndReturn::Continue
-                        }
-                        OnError::Fail => ScanAndReturn::Error(err),
-                    };
-                }
-                Poll::Ready(None) => {
-                    self.reader = None;
-                    self.metrics.files_processed.add(1);
-                    self.metrics.time_scanning_until_data.stop();
-                    self.metrics.time_scanning_total.stop();
-                    return ScanAndReturn::Continue;
-                }
-            }
+        // 4. active reader
+        if let Some(ret) = self.poll_reader(cx) {
+            return ret;
         }
 
-        // No active reader, but a morsel is ready to become the reader.
-        if let Some(morsel) = self.ready_morsels.pop_front() {
+        let mut guard = pool.lock();
+        // 5. next morsel
+        if let Some(morsel) = guard.take_morsel() {
+            drop(guard);
             self.metrics.time_opening.stop();
-            self.metrics.time_scanning_until_data.start();
-            self.metrics.time_scanning_total.start();
-            self.reader = Some(morsel.into_stream());
-            return ScanAndReturn::Continue;
-        }
-
-        // Do not start CPU planning or open another file while planner I/O is
-        // still outstanding because they may need additional IO and ScanState
-        // currently only permits a single outstanding IO
-        if self.pending_planner.is_some() {
-            return ScanAndReturn::Return(Poll::Pending);
-        }
-
-        // No reader or morsel, so try to produce more work via CPU planning.
-        if let Some(planner) = self.ready_planners.pop_front() {
-            return match planner.plan() {
-                Ok(Some(mut plan)) => {
-                    // Queue any newly-ready morsels, planners, or planner I/O.
-                    self.ready_morsels.extend(plan.take_morsels());
-                    self.ready_planners.extend(plan.take_ready_planners());
-                    if let Some(pending_planner) = plan.take_pending_planner() {
-                        // should not have planned if we have outstanding I/O
-                        if self.pending_planner.is_some() {
-                            return ScanAndReturn::Error(internal_datafusion_err!(
-                                "Conflicting pending planner state in FileStream ScanState"
-                            ));
-                        }
-                        self.pending_planner = Some(pending_planner);
-                    }
-                    ScanAndReturn::Continue
-                }
-                Ok(None) => {
-                    self.metrics.files_processed.add(1);
-                    self.metrics.time_opening.stop();
+            start_timer(&mut self.metrics.time_scanning_until_data);
+            start_timer(&mut self.metrics.time_scanning_total);
+            return match morsel.morsel.into_stream() {
+                Ok(stream) => {
+                    self.reader = Some(ActiveReader {
+                        unit: morsel.unit,
+                        bytes: morsel.bytes,
+                        stream,
+                    });
                     ScanAndReturn::Continue
                 }
                 Err(err) => {
                     self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    match self.on_error {
-                        OnError::Skip => {
-                            self.metrics.files_processed.add(1);
-                            ScanAndReturn::Continue
-                        }
-                        OnError::Fail => ScanAndReturn::Error(err),
-                    }
+                    pool.lock()
+                        .finish_read(morsel.unit, morsel.bytes, &mut self.metrics);
+                    self.error(err)
                 }
             };
         }
 
-        // No outstanding work remains, so begin planning the next unopened file.
-        let Some(part_file) = self.work_source.pop_front() else {
-            return ScanAndReturn::Done(None);
-        };
+        // 6. open more work
+        if !self.source_done && guard.may_open_unit() {
+            match self.work_source.pop_front() {
+                Some(file) => {
+                    start_timer(&mut self.metrics.time_opening);
+                    let unit = guard.begin_open();
+                    drop(guard);
+                    // CPU work, outside the lock
+                    let planner = self.morselizer.plan_file(file);
+                    let step = pool.lock().finish_open(
+                        unit,
+                        planner,
+                        &mut self.metrics,
+                        skip_errors,
+                    );
+                    return Self::step_result(step).unwrap_or(ScanAndReturn::Continue);
+                }
+                None => self.source_done = true,
+            }
+        }
 
-        self.metrics.time_opening.start();
-        match self.morselizer.plan_file(part_file) {
-            Ok(planner) => {
-                self.metrics.files_opened.add(1);
-                self.ready_planners.push_back(planner);
+        // Done once no file is left and nothing in the pool can be driven or
+        // waited for. Morsels other streams are reading don't count: they
+        // produce no further work.
+        if self.source_done && !guard.has_pending_work() {
+            return ScanAndReturn::Done(None);
+        }
+        // Something may have become ready since the checks above (e.g. while
+        // planning outside the lock); otherwise wait to be woken by the pool
+        // (completed I/O, new work, freed budget) or by in-flight inline I/O.
+        if guard.has_ready_work(false) || (!self.source_done && guard.may_open_unit()) {
+            return ScanAndReturn::Continue;
+        }
+        guard.register(cx.waker(), !self.source_done);
+        ScanAndReturn::Return(Poll::Pending)
+    }
+
+    /// Handle an error that ends the current item.
+    fn error(&mut self, err: DataFusionError) -> ScanAndReturn {
+        match self.on_error {
+            OnError::Skip => ScanAndReturn::Continue,
+            OnError::Fail => ScanAndReturn::Error(err),
+        }
+    }
+
+    /// If there is an active reader, poll it for the next batch.
+    fn poll_reader(&mut self, cx: &mut Context<'_>) -> Option<ScanAndReturn> {
+        let reader = self.reader.as_mut()?;
+        let next = match &mut reader.stream {
+            MorselStream::Sync(iter) => Poll::Ready(iter.next()),
+            MorselStream::Async(stream) => stream.poll_next_unpin(cx),
+        };
+        Some(match next {
+            // Morsels should ideally only expose ready-to-decode streams,
+            // but tolerate pending readers here.
+            Poll::Pending => ScanAndReturn::Return(Poll::Pending),
+            Poll::Ready(Some(Ok(batch))) => self.handle_batch(batch),
+            Poll::Ready(Some(Err(err))) => {
+                self.metrics.file_scan_errors.add(1);
+                self.finish_reader();
+                self.error(err)
+            }
+            Poll::Ready(None) => {
+                self.finish_reader();
                 ScanAndReturn::Continue
             }
-            Err(err) => match self.on_error {
-                OnError::Skip => {
-                    self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    self.metrics.files_processed.add(1);
-                    ScanAndReturn::Continue
+        })
+    }
+
+    /// Drop the active reader and release its morsel.
+    fn finish_reader(&mut self) {
+        let reader = self.reader.take().expect("active reader");
+        self.metrics.time_scanning_until_data.stop();
+        self.metrics.time_scanning_total.stop();
+        self.pool
+            .lock()
+            .finish_read(reader.unit, reader.bytes, &mut self.metrics);
+    }
+
+    fn handle_batch(&mut self, batch: RecordBatch) -> ScanAndReturn {
+        self.metrics.time_scanning_until_data.stop();
+        self.metrics.time_scanning_total.stop();
+        // Apply any remaining row limit.
+        let (batch, finished) = match &mut self.remain {
+            Some(remain) => {
+                if *remain > batch.num_rows() {
+                    *remain -= batch.num_rows();
+                    self.metrics.time_scanning_total.start();
+                    (batch, false)
+                } else {
+                    let batch = batch.slice(0, *remain);
+                    let open_files = self.pool.lock().open_files();
+                    let done = open_files + self.work_source.skipped_on_limit();
+                    self.metrics.files_processed.add(done);
+                    *remain = 0;
+                    (batch, true)
                 }
-                OnError::Fail => ScanAndReturn::Error(err),
-            },
+            }
+            None => {
+                self.metrics.time_scanning_total.start();
+                (batch, false)
+            }
+        };
+        if finished {
+            ScanAndReturn::Done(Some(Ok(batch)))
+        } else {
+            ScanAndReturn::Return(Poll::Ready(Some(Ok(batch))))
         }
     }
 }

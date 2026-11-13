@@ -771,9 +771,12 @@ impl DataSource for FileScanConfig {
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
 
+        let exec_options = &context.session_config().options().execution;
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
+            .with_io_budget(Some(Arc::clone(context.io_budget())))
+            .with_split_morsels(exec_options.scan_split_morsels)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
             .build()?;

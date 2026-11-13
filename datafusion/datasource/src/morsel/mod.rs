@@ -28,6 +28,33 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Return value of [`Morsel::into_stream`].
+pub enum MorselStream {
+    /// An `async` stream of [`RecordBatch`]es.
+    ///
+    /// This is used by morsels that still need to perform I/O while producing
+    /// batches (for example, the [`FileOpener`] adapter). Implementations
+    /// should prefer [`Self::Sync`] when all I/O has already completed so that
+    /// I/O and CPU work are separated by the type system.
+    ///
+    /// [`FileOpener`]: crate::file_stream::FileOpener
+    Async(BoxStream<'static, Result<RecordBatch>>),
+    /// An iterator of [`RecordBatch`]es that does not require any more I/O.
+    ///
+    /// This API is explicitly not `async`: the morsel has all the data it
+    /// needs and only performs CPU work (e.g. decoding) to produce batches.
+    Sync(Box<dyn Iterator<Item = Result<RecordBatch>> + Send>),
+}
+
+impl Debug for MorselStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Async(_) => f.write_str("MorselStream::Async"),
+            Self::Sync(_) => f.write_str("MorselStream::Sync"),
+        }
+    }
+}
+
 /// A Morsel of work ready to resolve to a stream of [`RecordBatch`]es.
 ///
 /// This represents a single morsel of work that is ready to be processed. It
@@ -37,8 +64,19 @@ pub trait Morsel: Send + Debug {
     /// Consume this morsel and produce a stream of [`RecordBatch`]es for processing.
     ///
     /// Note: This may do CPU work to decode already-loaded data, but should not
-    /// do any I/O work such as reading from the file.
-    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>>;
+    /// do any I/O work such as reading from the file. Morsels that have all
+    /// their data should return [`MorselStream::Sync`].
+    fn into_stream(self: Box<Self>) -> Result<MorselStream>;
+
+    /// Number of bytes of already-fetched (buffered) input this morsel holds
+    /// until it has been fully consumed.
+    ///
+    /// This is used to bound the amount of fetched-but-not-yet-decoded data
+    /// a scan keeps in memory when it issues I/O ahead of decoding (see
+    /// `datafusion.execution.scan_io_budget_bytes`). Returns `0` by default.
+    fn buffered_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// A Morselizer takes a single [`PartitionedFile`] and creates the initial planner
@@ -53,6 +91,26 @@ pub trait Morselizer: Send + Sync + Debug {
     /// work, such as reading from the file. Any needed I/O should be done using
     /// [`MorselPlan::with_pending_planner`].
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>>;
+
+    /// Allow (or disallow) this morselizer to split a file into several
+    /// independent [`MorselPlanner`]s (returned together from a single
+    /// [`MorselPlanner::plan`] call) whose morsels may be read in any order,
+    /// concurrently, or by sibling streams.
+    ///
+    /// `FileStream` only enables this when the scan does not need to preserve
+    /// order and has an I/O budget. The default implementation ignores it.
+    fn set_split_files(&mut self, _split: bool) {}
+
+    /// Does reading this morsel's output in planned order make the scan
+    /// cheaper, even though any order is correct?
+    ///
+    /// For example, a Parquet scan whose row groups were reordered so that a
+    /// TopK dynamic filter tightens as early as possible. `FileStream` then
+    /// still prefetches (and may split / share) work, but consumes it in
+    /// planned order. Defaults to `false`.
+    fn prefers_ordered_read(&self) -> bool {
+        false
+    }
 }
 
 /// A Morsel Planner is responsible for creating morsels for a given scan.
@@ -146,6 +204,13 @@ impl MorselPlan {
         self
     }
 
+    /// Set an already constructed pending planner (e.g. one carrying an
+    /// [`PendingMorselPlanner::with_io_bytes`] hint).
+    pub fn with_pending(mut self, pending: PendingMorselPlanner) -> Self {
+        self.pending_planner = Some(pending);
+        self
+    }
+
     /// Set the pending planner  for an I/O phase.
     pub fn set_pending_planner<F>(&mut self, io_future: F)
     where
@@ -176,8 +241,14 @@ impl MorselPlan {
 }
 
 /// Wrapper for I/O that must complete before planning can continue.
+///
+/// The wrapped future is lazy: no I/O is issued until it is first polled.
+/// `FileStream` relies on this to only start I/O when it fits within its I/O
+/// budget.
 pub struct PendingMorselPlanner {
     future: BoxFuture<'static, Result<Box<dyn MorselPlanner>>>,
+    /// Number of bytes this I/O will fetch, if known.
+    io_bytes: Option<usize>,
 }
 
 impl PendingMorselPlanner {
@@ -202,7 +273,24 @@ impl PendingMorselPlanner {
     {
         Self {
             future: future.boxed(),
+            io_bytes: None,
         }
+    }
+
+    /// Record how many bytes this I/O is expected to fetch.
+    ///
+    /// When known, `FileStream` charges this amount against its I/O budget
+    /// while the I/O is in flight. I/O of unknown size (e.g. metadata reads)
+    /// is not charged, but `FileStream` will not start planning additional
+    /// files while such I/O is outstanding.
+    pub fn with_io_bytes(mut self, io_bytes: usize) -> Self {
+        self.io_bytes = Some(io_bytes);
+        self
+    }
+
+    /// Number of bytes this I/O is expected to fetch, if known.
+    pub fn io_bytes(&self) -> Option<usize> {
+        self.io_bytes
     }
 
     /// Consume this wrapper and return the underlying future.

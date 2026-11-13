@@ -160,6 +160,17 @@ impl ByteProgress {
         self.remaining -= bytes;
         self.bytes_processed.add(bytes);
     }
+
+    /// Move `bytes` of the not-yet-credited range into a new tracker, e.g.
+    /// when a file range is split into independently scanned parts.
+    pub(crate) fn split_off(&mut self, bytes: u64) -> ByteProgress {
+        let bytes = saturating_usize(bytes).min(self.remaining);
+        self.remaining -= bytes;
+        ByteProgress {
+            remaining: bytes,
+            bytes_processed: self.bytes_processed.clone(),
+        }
+    }
 }
 
 /// Narrow a byte count to the width [`Count`] stores, saturating rather than

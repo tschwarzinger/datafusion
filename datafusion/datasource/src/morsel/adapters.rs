@@ -4,7 +4,7 @@
 
 use crate::PartitionedFile;
 use crate::file_stream::FileOpener;
-use crate::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
+use crate::morsel::{Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer};
 use arrow::array::RecordBatch;
 use datafusion_common::Result;
 use futures::FutureExt;
@@ -103,7 +103,7 @@ impl Debug for FileStreamMorsel {
 }
 
 impl Morsel for FileStreamMorsel {
-    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
-        self.stream
+    fn into_stream(self: Box<Self>) -> Result<MorselStream> {
+        Ok(MorselStream::Async(self.stream))
     }
 }
