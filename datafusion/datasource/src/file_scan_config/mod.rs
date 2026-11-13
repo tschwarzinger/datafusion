@@ -775,7 +775,7 @@ impl DataSource for FileScanConfig {
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
             .with_shared_work_source(shared_work_source)
-            .with_io_budget_bytes(exec_options.scan_io_budget_bytes)
+            .with_io_budget(Some(Arc::clone(context.io_budget())))
             .with_split_morsels(exec_options.scan_split_morsels)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())

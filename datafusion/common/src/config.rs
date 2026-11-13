@@ -1132,16 +1132,18 @@ config_namespace! {
         /// runtime reassignment occurs.
         pub enable_file_stream_work_stealing: bool, default = true
 
-        /// Per-partition budget, in bytes, for file scan I/O that is in
-        /// flight or fetched but not yet decoded.
+        /// Budget, in bytes, for file scan I/O of a query that is in flight
+        /// or fetched but not yet decoded.
         ///
+        /// The budget is shared by all scans and all partitions of a query.
         /// With `0` (the default) each scan partition has at most one I/O
         /// outstanding, and fetching and decoding strictly alternate. With a
-        /// non-zero value, a scan partition issues further I/O (the next
-        /// row groups of a Parquet file, further files, or work donated by
-        /// sibling partitions) while it decodes, as long as the bytes of
-        /// in-flight I/O plus fetched-but-not-yet-decoded data stay within
-        /// this budget. Larger values help most on high-latency object
+        /// non-zero value, scans issue further I/O (the next row groups of a
+        /// Parquet file, further files) while they decode, as long as the bytes
+        /// of in-flight I/O plus fetched-but-not-yet-decoded data of the whole
+        /// query stay within this budget. A scan with nothing in flight may
+        /// always start one I/O, so a scan never waits for budget held by
+        /// another scan. Larger values help most on high-latency object
         /// stores. Ignored for scans with a row limit.
         pub scan_io_budget_bytes: usize, default = 0
 

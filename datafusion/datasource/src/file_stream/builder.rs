@@ -10,6 +10,7 @@ use crate::file_stream::work_pool::PoolConfig;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
 use crate::morsel::{FileOpenerMorselizer, Morselizer};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::IoBudget;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 
 use super::metrics::FileStreamMetrics;
@@ -23,7 +24,7 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
-    io_budget_bytes: usize,
+    io_budget: Option<Arc<IoBudget>>,
     split_morsels: bool,
 }
 
@@ -37,7 +38,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
-            io_budget_bytes: 0,
+            io_budget: None,
             split_morsels: true,
         }
     }
@@ -85,9 +86,13 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
-    /// Configure the I/O budget (see `datafusion.execution.scan_io_budget_bytes`).
-    pub fn with_io_budget_bytes(mut self, io_budget_bytes: usize) -> Self {
-        self.io_budget_bytes = io_budget_bytes;
+    /// Configure the query-wide I/O budget used to prefetch I/O ahead of
+    /// decoding (see [`TaskContext::io_budget`]). Without one (the default),
+    /// at most one I/O is outstanding at a time.
+    ///
+    /// [`TaskContext::io_budget`]: datafusion_execution::TaskContext::io_budget
+    pub fn with_io_budget(mut self, io_budget: Option<Arc<IoBudget>>) -> Self {
+        self.io_budget = io_budget;
         self
     }
 
@@ -107,7 +112,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
-            io_budget_bytes,
+            io_budget,
             split_morsels,
         } = self;
 
@@ -132,12 +137,9 @@ impl<'a> FileStreamBuilder<'a> {
         };
 
         let preserve_order = config.preserves_file_order();
-        let io_budget_bytes = if config.limit.is_some() {
-            0
-        } else {
-            io_budget_bytes
-        };
-        let split = split_morsels && io_budget_bytes > 0 && !preserve_order;
+        let io_budget =
+            io_budget.filter(|budget| budget.is_enabled() && config.limit.is_none());
+        let split = split_morsels && io_budget.is_some() && !preserve_order;
         morselizer.set_split_files(split);
         let read_order = if preserve_order {
             ReadOrder::Required
@@ -155,7 +157,7 @@ impl<'a> FileStreamBuilder<'a> {
             on_error,
             file_stream_metrics,
             PoolConfig {
-                io_budget: io_budget_bytes,
+                io_budget,
                 read_order,
                 streams: config.file_groups.len(),
             },

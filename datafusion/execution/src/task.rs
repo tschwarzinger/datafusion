@@ -3,14 +3,17 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use crate::{
-    config::SessionConfig, memory_pool::MemoryPool, registry::FunctionRegistry,
+    IoBudget, config::SessionConfig, memory_pool::MemoryPool, registry::FunctionRegistry,
     runtime_env::RuntimeEnv,
 };
 use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
 use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use std::collections::HashSet;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 /// Task Execution Context
 ///
@@ -53,6 +56,9 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    /// Query-wide I/O prefetch budget, created on first use from
+    /// `datafusion.execution.scan_io_budget_bytes`.
+    io_budget: OnceLock<Arc<IoBudget>>,
 }
 
 impl Default for TaskContext {
@@ -69,6 +75,7 @@ impl Default for TaskContext {
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
             runtime,
+            io_budget: OnceLock::new(),
         }
     }
 }
@@ -99,6 +106,7 @@ impl TaskContext {
             aggregate_functions,
             window_functions,
             runtime,
+            io_budget: OnceLock::new(),
         }
     }
 
@@ -143,9 +151,24 @@ impl TaskContext {
         &self.window_functions
     }
 
+    /// Return the query-wide [`IoBudget`] for prefetching scan I/O.
+    ///
+    /// A `TaskContext` is created per query (see [`SessionContext::task_ctx`])
+    /// and shared by all its operators, so all scans of a query share this
+    /// budget. Its limit is `datafusion.execution.scan_io_budget_bytes` at the
+    /// time of the first call; `0` disables prefetching.
+    ///
+    /// [`SessionContext::task_ctx`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html#method.task_ctx
+    pub fn io_budget(&self) -> &Arc<IoBudget> {
+        self.io_budget.get_or_init(|| {
+            IoBudget::new(self.session_config.options().execution.scan_io_budget_bytes)
+        })
+    }
+
     /// Update the [`SessionConfig`]
     pub fn with_session_config(mut self, session_config: SessionConfig) -> Self {
         self.session_config = session_config;
+        self.io_budget = OnceLock::new();
         self
     }
 

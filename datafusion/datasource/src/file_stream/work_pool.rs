@@ -15,6 +15,7 @@ use futures::FutureExt as _;
 use parking_lot::Mutex;
 
 use crate::morsel::{Morsel, MorselPlan, MorselPlanner, PendingMorselPlanner};
+use datafusion_execution::IoBudget;
 
 use super::FileStreamMetrics;
 
@@ -43,11 +44,12 @@ pub(super) enum ReadOrder {
 }
 
 /// Configuration of a [`WorkPool`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct PoolConfig {
-    /// Maximum bytes of in-flight I/O plus fetched-but-not-yet-read morsels.
-    /// `0` means a single outstanding I/O at a time (legacy mode).
-    pub(super) io_budget: usize,
+    /// Query-wide budget for in-flight I/O plus fetched-but-not-yet-read
+    /// morsels. `None` (or a disabled budget) means a single outstanding I/O
+    /// at a time (legacy mode).
+    pub(super) io_budget: Option<Arc<IoBudget>>,
     pub(super) read_order: ReadOrder,
     /// Number of streams driving this pool.
     pub(super) streams: usize,
@@ -174,11 +176,12 @@ impl WorkPool {
     }
 
     fn legacy(&self) -> bool {
-        self.config.io_budget == 0
+        self.budget().is_none()
     }
 
-    fn reserved_bytes(&self) -> usize {
-        self.in_flight_bytes + self.buffered_bytes
+    /// The query-wide budget, if prefetching is enabled.
+    fn budget(&self) -> Option<&Arc<IoBudget>> {
+        self.config.io_budget.as_ref().filter(|b| b.is_enabled())
     }
 
     // ---------------------------------------------------------------
@@ -242,9 +245,18 @@ impl WorkPool {
     }
 
     /// Register a stream that found nothing to do.
-    pub(super) fn register(&mut self, waker: &Waker) {
+    ///
+    /// With `may_open_more`, the stream could open more work once budget is
+    /// available, so it also waits for budget released by other scans of the
+    /// query.
+    pub(super) fn register(&mut self, waker: &Waker, may_open_more: bool) {
         if !self.wakers.iter().any(|w| w.will_wake(waker)) {
             self.wakers.push(waker.clone());
+        }
+        if (may_open_more || !self.unstarted_io.is_empty())
+            && let Some(budget) = self.budget()
+        {
+            budget.register(waker);
         }
     }
 
@@ -277,7 +289,12 @@ impl WorkPool {
             };
             let io = self.in_flight.swap_remove(idx);
             match io.bytes {
-                Some(b) => self.in_flight_bytes -= b,
+                Some(b) => {
+                    self.in_flight_bytes -= b;
+                    if let Some(budget) = self.budget() {
+                        budget.release(b);
+                    }
+                }
                 None => self.in_flight_unknown -= 1,
             }
             step = PoolStep::Progress;
@@ -298,29 +315,46 @@ impl WorkPool {
     }
 
     /// May the I/O at the front of `unstarted_io` be started now?
-    fn can_start_io(&self, stream_reading: bool) -> bool {
+    ///
+    /// With `reserve`, the bytes are reserved from the query-wide budget if
+    /// the I/O may start.
+    fn admit_io(&self, stream_reading: bool, reserve: bool) -> bool {
         let Some((_, pending)) = self.unstarted_io.front() else {
             return false;
         };
-        if self.legacy() {
+        let Some(budget) = self.budget() else {
             // a single outstanding I/O, which may overlap the active reader
             return self.in_flight.is_empty();
-        }
-        // Always allow one I/O when nothing else is in flight or being read,
-        // so an item larger than the budget still makes progress.
+        };
+        let bytes = pending.io_bytes().unwrap_or(0);
+        // Always allow one I/O when this scan has nothing in flight or being
+        // read, so a scan makes progress even if other scans of the query hold
+        // the whole budget, and an item larger than the budget still runs.
         let nothing_running = self.in_flight.is_empty()
             && self.active_readers == 0
             && !stream_reading
             && self.eligible_morsel_index().is_none();
-        let fits = self.reserved_bytes() + pending.io_bytes().unwrap_or(0)
-            <= self.config.io_budget;
-        nothing_running || fits
+        if nothing_running {
+            if reserve {
+                budget.force_reserve(bytes);
+            }
+            return true;
+        }
+        if reserve {
+            budget.try_reserve(bytes)
+        } else {
+            budget.reserved() + bytes <= budget.limit()
+        }
+    }
+
+    fn can_start_io(&self, stream_reading: bool) -> bool {
+        self.admit_io(stream_reading, false)
     }
 
     /// Start I/O as allowed by the budget. Returns true if any I/O was started.
     pub(super) fn start_io(&mut self, this: &SharedPool, stream_reading: bool) -> bool {
         let mut started = false;
-        while self.can_start_io(stream_reading) {
+        while self.admit_io(stream_reading, true) {
             let (unit, pending) = self.unstarted_io.pop_front().expect("front");
             let bytes = pending.io_bytes();
             match bytes {
@@ -427,6 +461,10 @@ impl WorkPool {
         for morsel in morsels {
             let bytes = morsel.buffered_bytes();
             self.buffered_bytes += bytes;
+            // already fetched: charged to the budget until read
+            if let Some(budget) = self.budget() {
+                budget.force_reserve(bytes);
+            }
             self.ready_morsels.push_back(ReadyMorsel {
                 unit,
                 morsel,
@@ -467,7 +505,7 @@ impl WorkPool {
             // adapter) can't be charged against the budget: don't open more
             // work while such a morsel is waiting
             && self.ready_morsels.iter().all(|m| m.bytes > 0)
-            && self.reserved_bytes() < self.config.io_budget
+            && self.budget().is_some_and(|b| b.has_available())
     }
 
     /// Register a newly opened file whose planner is being created outside
@@ -546,6 +584,9 @@ impl WorkPool {
         metrics: &mut FileStreamMetrics,
     ) {
         self.buffered_bytes -= bytes;
+        if let Some(budget) = self.budget() {
+            budget.release(bytes);
+        }
         self.active_readers -= 1;
         if let Some(u) = self.units.get_mut(&unit) {
             u.reading -= 1;
@@ -577,6 +618,16 @@ impl WorkPool {
             || self.can_plan(stream_reading)
             || self.can_start_io(stream_reading)
             || (!stream_reading && self.eligible_morsel_index().is_some())
+    }
+}
+
+impl Drop for WorkPool {
+    /// Return this scan's reservations to the query-wide budget, e.g. when
+    /// the scan is dropped early (LIMIT, cancellation).
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget() {
+            budget.release(self.in_flight_bytes + self.buffered_bytes);
+        }
     }
 }
 

@@ -29,11 +29,11 @@ pub(super) use super::work_pool::ReadOrder;
 ///
 /// # I/O budget
 ///
-/// With an I/O budget of `0` (the default), the `ScanState` only ever has a
+/// Without an I/O budget (the default), the `ScanState` only ever has a
 /// single I/O outstanding and does not plan new work while a reader is
 /// active, i.e. I/O and decoding strictly alternate.
 ///
-/// With a non-zero budget, I/O is issued ahead of decoding (the next row
+/// With a budget, I/O is issued ahead of decoding (the next row
 /// groups of the current file, further files) as long as
 ///
 /// ```text
@@ -44,8 +44,10 @@ pub(super) use super::work_pool::ReadOrder;
 /// read, so a single item larger than the budget still makes progress. I/O
 /// futures are lazy and only started once they fit the budget. Started I/O is
 /// spawned onto the Tokio runtime (when available) so it makes progress while
-/// streams decode. A shared pool has a budget of the per-partition budget
-/// times the number of partitions.
+/// streams decode. The budget is shared by all scans of the query (see
+/// [`IoBudget`]).
+///
+/// [`IoBudget`]: datafusion_execution::IoBudget
 ///
 /// # Sharing work
 ///
@@ -114,9 +116,9 @@ fn start_timer(time: &mut StartableTime) {
 impl ScanState {
     /// Create a new scan state.
     ///
-    /// The pool is shared with sibling streams when they share a work source
-    /// and the scan has an I/O budget (`config.io_budget > 0`, which requires
-    /// that order is not [`ReadOrder::Required`]); otherwise it is private.
+    /// The pool is shared with sibling streams when they share a work source,
+    /// the query has an I/O budget and order is not [`ReadOrder::Required`];
+    /// otherwise it is private.
     pub(super) fn new(
         work_source: WorkSource,
         remain: Option<usize>,
@@ -127,16 +129,12 @@ impl ScanState {
     ) -> Self {
         if remain.is_some() {
             // avoid reading ahead data that will not be needed
-            config.io_budget = 0;
+            config.io_budget = None;
         }
+        let prefetch = config.io_budget.as_ref().is_some_and(|b| b.is_enabled());
         let pool = match work_source.shared() {
-            Some(shared)
-                if config.io_budget > 0 && config.read_order != ReadOrder::Required =>
-            {
-                shared.pool(PoolConfig {
-                    io_budget: config.io_budget.saturating_mul(config.streams.max(1)),
-                    ..config
-                })
+            Some(shared) if prefetch && config.read_order != ReadOrder::Required => {
+                shared.pool(config)
             }
             _ => WorkPool::new_shared(PoolConfig {
                 streams: 1,
@@ -279,7 +277,7 @@ impl ScanState {
         if guard.has_ready_work(false) || (!self.source_done && guard.may_open_unit()) {
             return ScanAndReturn::Continue;
         }
-        guard.register(cx.waker());
+        guard.register(cx.waker(), !self.source_done);
         ScanAndReturn::Return(Poll::Pending)
     }
 

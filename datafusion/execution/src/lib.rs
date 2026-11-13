@@ -18,6 +18,7 @@ mod async_stream;
 pub mod cache;
 pub mod config;
 pub mod disk_manager;
+pub mod io_budget;
 pub mod memory_pool;
 pub mod object_store;
 #[cfg(feature = "parquet_encryption")]
@@ -35,6 +36,7 @@ pub mod registry {
 
 pub use async_stream::{Emitter, TryEmitter, async_stream, async_try_stream};
 pub use disk_manager::DiskManager;
+pub use io_budget::IoBudget;
 pub use registry::FunctionRegistry;
 pub use spill_file::{AsyncSpillWriter, SpillFile, SpillWriter, TempFileFactory};
 pub use stream::{RecordBatchStream, SendableRecordBatchStream};

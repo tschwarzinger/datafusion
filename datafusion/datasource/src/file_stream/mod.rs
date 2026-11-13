@@ -1644,7 +1644,8 @@ mod tests {
             )
             .with_io_budget_bytes(1000);
         let metrics = ExecutionPlanMetricsSet::new();
-        let mut streams = test.build_streams(&metrics)?;
+        let budget = datafusion_execution::IoBudget::new(1000);
+        let mut streams = test.build_streams(&metrics, &budget)?;
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
 
         // Partition 0 opens file1, splits it and starts all row group I/O.
@@ -1682,6 +1683,57 @@ mod tests {
         Ok(())
     }
 
+    /// The I/O budget is shared by all scans of a query: once one scan holds
+    /// the budget, another scan only gets the one I/O that is always allowed
+    /// (so it makes progress), and all reservations are returned when the
+    /// scans finish.
+    #[tokio::test]
+    async fn morsel_io_budget_is_shared_between_scans() -> Result<()> {
+        let budget = datafusion_execution::IoBudget::new(150);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let scan = |test: FileStreamMorselTest| -> Result<FileStream> {
+            Ok(test.build_streams(&metrics, &budget)?.remove(0))
+        };
+        let mut scan_a = scan(two_sized_io_files(FileStreamMorselTest::new(), (5, 5)))?;
+        let mut scan_b = scan(two_sized_io_files(FileStreamMorselTest::new(), (5, 5)))?;
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+
+        // A: first I/O (100 bytes) starts; the second does not fit in 150.
+        assert!(scan_a.poll_next_unpin(&mut cx).is_pending());
+        assert_eq!(budget.reserved(), 100);
+        // B: nothing of B runs yet, so B may start one I/O although the budget
+        // is held by A, but no more.
+        assert!(scan_b.poll_next_unpin(&mut cx).is_pending());
+        assert_eq!(budget.reserved(), 200);
+
+        for scan in [&mut scan_a, &mut scan_b] {
+            let mut batches = 0;
+            while let Some(batch) = scan.next().await {
+                batch?;
+                batches += 1;
+            }
+            assert_eq!(batches, 2);
+        }
+        assert_eq!(budget.reserved(), 0, "all reservations must be returned");
+        Ok(())
+    }
+
+    /// Dropping a scan early (e.g. LIMIT above it, cancellation) returns its
+    /// reservations to the query-wide budget.
+    #[tokio::test]
+    async fn morsel_io_budget_released_on_drop() -> Result<()> {
+        let budget = datafusion_execution::IoBudget::new(1000);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let test = two_sized_io_files(FileStreamMorselTest::new(), (5, 5));
+        let mut scan = test.build_streams(&metrics, &budget)?.remove(0);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(scan.poll_next_unpin(&mut cx).is_pending());
+        assert_eq!(budget.reserved(), 200);
+        drop(scan);
+        assert_eq!(budget.reserved(), 0);
+        Ok(())
+    }
+
     /// Tests how one or more `FileStream`s consume morselized file work.
     #[derive(Clone)]
     struct FileStreamMorselTest {
@@ -1714,7 +1766,7 @@ mod tests {
             }
         }
 
-        /// Sets `datafusion.execution.scan_io_budget_bytes` for all streams.
+        /// Sets the query-wide I/O budget shared by all streams.
         fn with_io_budget_bytes(mut self, io_budget_bytes: usize) -> Self {
             self.io_budget_bytes = io_budget_bytes;
             self
@@ -1837,6 +1889,8 @@ mod tests {
             }
 
             let config = self.test_config();
+            // one query-wide budget shared by all streams
+            let io_budget = datafusion_execution::IoBudget::new(self.io_budget_bytes);
             // `DataSourceExec::execute` creates one execution-local shared
             // state object via `create_sibling_state()` and then passes it
             // to `open_with_sibling_state(...)`. These tests build
@@ -1855,7 +1909,7 @@ mod tests {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())
-                        .with_io_budget_bytes(self.io_budget_bytes)
+                        .with_io_budget(Some(Arc::clone(&io_budget)))
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;
@@ -1883,7 +1937,7 @@ mod tests {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())
-                        .with_io_budget_bytes(self.io_budget_bytes)
+                        .with_io_budget(Some(Arc::clone(&io_budget)))
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
                         .build()?;
@@ -1938,6 +1992,7 @@ mod tests {
         fn build_streams(
             &self,
             metrics_set: &ExecutionPlanMetricsSet,
+            io_budget: &Arc<datafusion_execution::IoBudget>,
         ) -> Result<Vec<FileStream>> {
             let config = self.test_config();
             let mut options = ConfigOptions::default();
@@ -1952,7 +2007,7 @@ mod tests {
                     FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())
-                        .with_io_budget_bytes(self.io_budget_bytes)
+                        .with_io_budget(Some(Arc::clone(io_budget)))
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(metrics_set)
                         .build()
