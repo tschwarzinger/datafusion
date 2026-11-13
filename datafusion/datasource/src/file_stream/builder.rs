@@ -25,7 +25,6 @@ pub struct FileStreamBuilder<'a> {
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
     io_budget: Option<Arc<IoBudget>>,
-    split_morsels: bool,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -39,7 +38,6 @@ impl<'a> FileStreamBuilder<'a> {
             on_error: OnError::Fail,
             shared_work_source: None,
             io_budget: None,
-            split_morsels: true,
         }
     }
 
@@ -96,13 +94,6 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
-    /// Configure whether files may be split into independent morsels
-    /// (see `datafusion.execution.scan_split_morsels`).
-    pub fn with_split_morsels(mut self, split_morsels: bool) -> Self {
-        self.split_morsels = split_morsels;
-        self
-    }
-
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -113,7 +104,6 @@ impl<'a> FileStreamBuilder<'a> {
             on_error,
             shared_work_source,
             io_budget,
-            split_morsels,
         } = self;
 
         let Some(partition) = partition else {
@@ -139,7 +129,11 @@ impl<'a> FileStreamBuilder<'a> {
         let preserve_order = config.preserves_file_order();
         let io_budget =
             io_budget.filter(|budget| budget.is_enabled() && config.limit.is_none());
-        let split = split_morsels && io_budget.is_some() && !preserve_order;
+        // With prefetch, split files into independent morsels (e.g. one per
+        // Parquet row group) when the order does not matter: this is what
+        // lets a scan fetch several parts of a file concurrently and lets
+        // partitions balance the work.
+        let split = io_budget.is_some() && !preserve_order;
         morselizer.set_split_files(split);
         let read_order = if preserve_order {
             ReadOrder::Required

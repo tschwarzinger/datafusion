@@ -3076,6 +3076,233 @@ mod test {
     /// with, so every one of these asserts the same invariant: by the time the
     /// stream is dropped it has advanced by exactly the size of the range,
     /// however the scan got there.
+    /// A dynamic filter that tightens while a file is being read can prove the
+    /// whole file unnecessary (file-level pruning on its statistics). The
+    /// file's morsels must then stop at once and release the decoder state:
+    /// releasing it is what completes the file's `bytes_processed` accounting,
+    /// so holding on to it would report a file the scan has finished with as
+    /// partly unread. (These replace the tests of the former
+    /// `EarlyStoppingStream`.)
+    mod dynamic_file_pruning {
+        use super::*;
+
+        /// A file with three row groups of `a` = 1..=3, 4..=6, 7..=9, and file
+        /// statistics (min 1, max 9) so a `FilePruner` can be built for it.
+        async fn setup() -> (Arc<dyn ObjectStore>, SchemaRef, PartitionedFile, u64) {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let batches = vec![
+                record_batch!(("a", Int32, vec![1, 2, 3])).unwrap(),
+                record_batch!(("a", Int32, vec![4, 5, 6])).unwrap(),
+                record_batch!(("a", Int32, vec![7, 8, 9])).unwrap(),
+            ];
+            let schema = batches[0].schema();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build();
+            let data_len = write_parquet_batches(
+                Arc::clone(&store),
+                "t.parquet",
+                batches,
+                Some(props),
+            )
+            .await as u64;
+            let statistics = Statistics {
+                num_rows: Precision::Exact(9),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![
+                    ColumnStatistics::new_unknown()
+                        .with_min_value(Precision::Exact(ScalarValue::Int32(Some(1))))
+                        .with_max_value(Precision::Exact(ScalarValue::Int32(Some(9))))
+                        .with_null_count(Precision::Exact(0)),
+                ],
+            };
+            let file = PartitionedFile::new("t.parquet", data_len)
+                .with_statistics(Arc::new(statistics));
+            (store, schema, file, data_len)
+        }
+
+        /// A dynamic `a > 0` filter, which keeps every row, and its morselizer
+        /// emitting one-row batches.
+        fn morselizer(
+            store: &Arc<dyn ObjectStore>,
+            schema: &SchemaRef,
+            metrics: &ExecutionPlanMetricsSet,
+            split: bool,
+        ) -> (Arc<DynamicFilterPhysicalExpr>, ParquetMorselizer) {
+            let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::new(Column::new("a", 0)) as _],
+                logical2physical(&col("a").gt(lit(0)), schema),
+            ));
+            let mut morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(store))
+                .with_schema(Arc::clone(schema))
+                .with_projection_indices(&[0])
+                .with_predicate(Arc::clone(&dynamic) as _)
+                .with_metrics(metrics.clone())
+                .build();
+            morselizer.batch_size = 1;
+            morselizer.set_split_files(split);
+            (dynamic, morselizer)
+        }
+
+        /// Tighten the filter so that no row of the file can match.
+        fn prune_file(dynamic: &DynamicFilterPhysicalExpr, schema: &SchemaRef) {
+            dynamic
+                .update(logical2physical(&col("a").gt(lit(100)), schema))
+                .unwrap();
+        }
+
+        /// Plan (awaiting I/O) until `n` morsels are ready. Returns the morsels
+        /// and the planners left over.
+        async fn plan_morsels(
+            mut planners: VecDeque<Box<dyn MorselPlanner>>,
+            n: usize,
+        ) -> (Vec<Box<dyn Morsel>>, VecDeque<Box<dyn MorselPlanner>>) {
+            let mut morsels = vec![];
+            while morsels.len() < n {
+                let planner = planners.pop_front().expect("more work to plan");
+                if let Some(mut plan) = planner.plan().unwrap() {
+                    morsels.extend(plan.take_morsels());
+                    planners.extend(plan.take_ready_planners());
+                    if let Some(io) = plan.take_pending_planner() {
+                        planners.push_back(io.await.unwrap());
+                    }
+                }
+            }
+            (morsels, planners)
+        }
+
+        fn sync_reader(
+            morsel: Box<dyn Morsel>,
+        ) -> Box<dyn Iterator<Item = Result<RecordBatch>> + Send> {
+            match morsel.into_stream().unwrap() {
+                MorselStream::Sync(iter) => iter,
+                MorselStream::Async(_) => panic!("parquet morsels are sync"),
+            }
+        }
+
+        fn files_pruned(metrics: &ExecutionPlanMetricsSet) -> usize {
+            match metrics
+                .clone_inner()
+                .sum_by_name("files_ranges_pruned_statistics")
+            {
+                Some(MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                }) => pruning_metrics.pruned(),
+                _ => panic!("files_ranges_pruned_statistics is registered"),
+            }
+        }
+
+        fn bytes_processed(metrics: &ExecutionPlanMetricsSet) -> u64 {
+            u64::try_from(counter_metric_value(metrics, "bytes_processed")).unwrap()
+        }
+
+        /// Pruning the file mid row group stops the row group at once, issues
+        /// no further I/O, credits the whole file and counts it as pruned once.
+        #[tokio::test]
+        async fn pruned_file_stops_and_releases() {
+            let (store, schema, file, data_len) = setup().await;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let (dynamic, morselizer) = morselizer(&store, &schema, &metrics, false);
+
+            let planners = VecDeque::from([morselizer.plan_file(file).unwrap()]);
+            let (mut morsels, mut planners) = plan_morsels(planners, 1).await;
+            let mut reader = sync_reader(morsels.remove(0));
+            assert_eq!(reader.next().unwrap().unwrap().num_rows(), 1);
+
+            prune_file(&dynamic, &schema);
+            assert!(
+                reader.next().is_none(),
+                "the row group must stop once the file is pruned"
+            );
+            drop(reader);
+
+            // the remaining row groups are neither fetched nor decoded
+            let continuation = planners.pop_front().expect("continuation planner");
+            assert!(planners.is_empty());
+            assert!(
+                continuation.plan().unwrap().is_none(),
+                "a pruned file must not plan more work or I/O"
+            );
+            assert_eq!(files_pruned(&metrics), 1);
+            assert_eq!(
+                bytes_processed(&metrics),
+                data_len,
+                "the pruned file must be fully credited once it is released"
+            );
+        }
+
+        /// A file read to the end is fully credited as soon as its last planner
+        /// finishes, and is not counted as pruned, even if the filter tightens
+        /// after its last batch.
+        #[tokio::test]
+        async fn exhausted_file_releases_and_is_not_pruned() {
+            let (store, schema, file, data_len) = setup().await;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let (dynamic, morselizer) = morselizer(&store, &schema, &metrics, false);
+
+            let mut planners = VecDeque::from([morselizer.plan_file(file).unwrap()]);
+            let mut rows = 0;
+            let mut tightened = false;
+            while let Some(planner) = planners.pop_front() {
+                let Some(mut plan) = planner.plan().unwrap() else {
+                    continue;
+                };
+                for morsel in plan.take_morsels() {
+                    rows += sync_reader(morsel)
+                        .map(|b| b.unwrap().num_rows())
+                        .sum::<usize>();
+                }
+                // tighten once all rows were read, before the planner finds
+                // out the file is done
+                if rows == 9 && !tightened {
+                    prune_file(&dynamic, &schema);
+                    tightened = true;
+                }
+                planners.extend(plan.take_ready_planners());
+                if let Some(io) = plan.take_pending_planner() {
+                    planners.push_back(io.await.unwrap());
+                }
+            }
+            assert_eq!(rows, 9);
+            assert_eq!(bytes_processed(&metrics), data_len);
+            assert_eq!(
+                files_pruned(&metrics),
+                0,
+                "a file whose work is done is not pruned"
+            );
+        }
+
+        /// When the file is split into one decoder per row group, pruning it
+        /// also stops the other row groups, including ones already fetched.
+        #[tokio::test]
+        async fn pruned_split_file_stops_all_row_groups() {
+            let (store, schema, file, data_len) = setup().await;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let (dynamic, morselizer) = morselizer(&store, &schema, &metrics, true);
+
+            let planners = VecDeque::from([morselizer.plan_file(file).unwrap()]);
+            // the first two row groups are fetched and ready to decode
+            let (morsels, planners) = plan_morsels(planners, 2).await;
+            let mut readers: Vec<_> = morsels.into_iter().map(sync_reader).collect();
+            assert_eq!(readers[0].next().unwrap().unwrap().num_rows(), 1);
+
+            prune_file(&dynamic, &schema);
+            for reader in &mut readers {
+                assert!(reader.next().is_none(), "all row groups must stop");
+            }
+            drop(readers);
+            for planner in planners {
+                assert!(
+                    planner.plan().unwrap().is_none(),
+                    "no further row group may be planned or fetched"
+                );
+            }
+            assert_eq!(files_pruned(&metrics), 1);
+            assert_eq!(bytes_processed(&metrics), data_len);
+        }
+    }
+
     /// With I/O prefetch, the decision to fetch or decode a row group can be
     /// made before a dynamic filter (e.g. from TopK) tightened. The dynamic
     /// row-group pruner is therefore re-checked right before a row group's
