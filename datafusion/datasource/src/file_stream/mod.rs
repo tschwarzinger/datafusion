@@ -1849,6 +1849,45 @@ mod tests {
         Ok(())
     }
 
+    /// A stream dropped while reading a morsel (e.g. cancelled) releases it, so
+    /// that with a shared pool its unit of work still finishes while sibling
+    /// streams continue (here: both files are counted as processed).
+    #[tokio::test]
+    async fn morsel_dropped_stream_releases_its_morsel() -> Result<()> {
+        let test = FileStreamMorselTest::new()
+            .with_file_in_partition(
+                PartitionId(0),
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(
+                        MockPlanBuilder::new()
+                            .with_morsel_batches(MorselId(10), vec![41, 42]),
+                    )
+                    .return_none(),
+            )
+            .with_file_in_partition(
+                PartitionId(1),
+                MockPlanner::builder("file2.parquet")
+                    .add_plan(MockPlanBuilder::new().with_morsel(MorselId(20), 51))
+                    .return_none(),
+            );
+        let budget = datafusion_execution::IoBudget::new(1000);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut streams = test.build_streams(&metrics, &budget)?;
+        let mut partition1 = streams.pop().unwrap();
+        let mut partition0 = streams.pop().unwrap();
+
+        // partition 0 reads the first batch of file1's morsel, then is dropped
+        let batch = partition0.next().await.unwrap()?;
+        assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 41);
+        drop(partition0);
+
+        while let Some(batch) = partition1.next().await {
+            batch?;
+        }
+        assert_eq!(metric_count(&metrics, "files_processed"), 2);
+        Ok(())
+    }
+
     /// Dropping a scan early (e.g. LIMIT above it, cancellation) returns its
     /// reservations to the query-wide budget.
     #[tokio::test]

@@ -747,8 +747,6 @@ impl Morsel for ParquetRowGroupMorsel {
 struct ParquetMorselPlanner {
     /// Ready to perform CPU-only planning work.
     state: ParquetOpenState,
-    /// See [`MorselPlanner::defer_planning`].
-    defer: bool,
 }
 
 impl fmt::Debug for ParquetMorselPlanner {
@@ -771,10 +769,7 @@ impl ParquetMorselPlanner {
         let state = ParquetOpenState::Start {
             prepared: Box::new(prepared),
         };
-        Ok(Self {
-            state,
-            defer: false,
-        })
+        Ok(Self { state })
     }
 
     /// Schedule an I/O future that resolves to the next planner to run.
@@ -792,10 +787,7 @@ impl ParquetMorselPlanner {
     {
         let io_future = async move {
             let next_state = future.await?;
-            Ok(Box::new(ParquetMorselPlanner {
-                state: next_state,
-                defer: false,
-            }) as _)
+            Ok(Box::new(ParquetMorselPlanner { state: next_state }) as _)
         };
         MorselPlan::new().with_pending_planner(io_future)
     }
@@ -834,13 +826,8 @@ impl ParquetMorselPlanner {
                     } else {
                         state.fetch(ranges).await?
                     };
-                    // The step after a fetch evaluates a pushed-down row
-                    // filter: defer it until the data is needed when the
-                    // filter can still tighten (e.g. TopK).
-                    let defer = state.defer_after_fetch;
                     Ok(Box::new(ParquetMorselPlanner {
                         state: ParquetOpenState::Decode(state),
-                        defer,
                     }) as Box<dyn MorselPlanner>)
                 };
                 Ok(Some(MorselPlan::new().with_pending(
@@ -855,7 +842,6 @@ impl ParquetMorselPlanner {
                 });
                 let next: Box<dyn MorselPlanner> = Box::new(ParquetMorselPlanner {
                     state: ParquetOpenState::Decode(state),
-                    defer: false,
                 });
                 Ok(Some(
                     MorselPlan::new()
@@ -870,7 +856,11 @@ impl ParquetMorselPlanner {
 
 impl MorselPlanner for ParquetMorselPlanner {
     fn defer_planning(&self) -> bool {
-        self.defer
+        // The step after a fetch evaluates a pushed-down row filter: defer it
+        // until its output is needed when the filter can still tighten (e.g.
+        // TopK). Fetched data no step has used yet marks that step.
+        matches!(&self.state, ParquetOpenState::Decode(state)
+            if state.defer_after_fetch && state.fetched_bytes > 0)
     }
 
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
@@ -913,7 +903,6 @@ impl MorselPlanner for ParquetMorselPlanner {
                     .map(|state| {
                         Box::new(Self {
                             state: ParquetOpenState::Decode(Box::new(state)),
-                            defer: false,
                         }) as _
                     })
                     .collect();
@@ -921,12 +910,10 @@ impl MorselPlanner for ParquetMorselPlanner {
             }
             ParquetOpenState::Decode(state) => Self::plan_decode(state),
             ParquetOpenState::Done => Ok(None),
-            cpu_state => Ok(Some(MorselPlan::new().with_planners(vec![Box::new(
-                Self {
-                    state: cpu_state,
-                    defer: false,
-                },
-            )]))),
+            cpu_state => Ok(Some(
+                MorselPlan::new()
+                    .with_planners(vec![Box::new(Self { state: cpu_state })]),
+            )),
         }
     }
 }

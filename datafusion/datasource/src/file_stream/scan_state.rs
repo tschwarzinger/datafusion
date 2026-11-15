@@ -351,6 +351,9 @@ impl ScanState {
                     let open_files = self.pool.lock().open_files();
                     let done = open_files + self.work_source.skipped_on_limit();
                     self.metrics.files_processed.add(done);
+                    // Its file was counted above: drop the reader without
+                    // finishing it (scans with a limit have a private pool).
+                    self.reader = None;
                     *remain = 0;
                     (batch, true)
                 }
@@ -364,6 +367,17 @@ impl ScanState {
             ScanAndReturn::Done(Some(Ok(batch)))
         } else {
             ScanAndReturn::Return(Poll::Ready(Some(Ok(batch))))
+        }
+    }
+}
+
+impl Drop for ScanState {
+    /// Release a morsel this stream was reading when it is dropped (finished,
+    /// failed or cancelled), so that with a shared pool its bytes return to
+    /// the budget and its unit of work can finish while siblings continue.
+    fn drop(&mut self) {
+        if self.reader.is_some() {
+            self.finish_reader();
         }
     }
 }
