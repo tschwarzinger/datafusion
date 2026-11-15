@@ -324,6 +324,17 @@ impl DecodeContext {
     }
 }
 
+impl Drop for DecodeContext {
+    /// Publish the final arrow-rs reader metrics once the file is done (its
+    /// last decoder and morsel dropped). They are otherwise only copied when
+    /// a batch is emitted, which would miss work done after the last batch,
+    /// e.g. evaluating the row filter of a trailing row group that matches no
+    /// rows, and make the reported values depend on scheduling.
+    fn drop(&mut self) {
+        self.copy_arrow_reader_metrics();
+    }
+}
+
 /// Result of [`PushDecoderStreamState::next_step`].
 pub(crate) enum DecodeStep {
     /// The decoder needs these byte ranges before it can make progress.
