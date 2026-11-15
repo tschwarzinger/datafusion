@@ -18,7 +18,7 @@ use crate::morsel::{Morsel, MorselPlan, MorselPlanner, PendingMorselPlanner};
 use datafusion_execution::IoBudget;
 
 use super::FileStreamMetrics;
-use super::policy::{self, Load};
+use super::policy::{Policy, PoolLoad};
 
 /// A [`WorkPool`] that may be shared by sibling streams.
 pub(super) type SharedPool = Arc<Mutex<WorkPool>>;
@@ -194,20 +194,8 @@ impl WorkPool {
     }
 
     /// Snapshot of what the pool holds, for the scheduling `policy`.
-    fn load(&self) -> Load {
-        Load {
-            streams: self.config.streams,
-            units: self.units.len(),
-            planning: self.planning,
-            ready_planners: self.ready_planners.len(),
-            unstarted_io: self.unstarted_io.len(),
-            in_flight: self.in_flight.len(),
-            in_flight_unknown: self.in_flight_unknown,
-            ready_morsels: self.ready_morsels.len(),
-            eligible_morsels: self.eligible_morsel_count(),
-            unsized_morsel: self.ready_morsels.iter().any(|m| m.bytes.is_none()),
-            readers: self.active_readers,
-        }
+    fn policy(&self) -> Policy<'_> {
+        Policy::new(self.budget())
     }
 
     // ---------------------------------------------------------------
@@ -407,17 +395,16 @@ impl WorkPool {
     }
 
     /// May the I/O at the front of `unstarted_io` be started now (see
-    /// `policy::admit_io`)? With `reserve`, its size is reserved if so.
+    /// [`Policy::admit_io`])? With `reserve`, its size is reserved if so.
     fn admit_io(&self, reserve: bool) -> bool {
         let Some((_, pending)) = self.unstarted_io.front() else {
             return false;
         };
-        let load = self.load();
         let bytes = pending.info().bytes;
         if reserve {
-            policy::admit_io(&load, bytes, self.budget())
+            self.policy().admit_io(self, bytes)
         } else {
-            policy::would_admit_io(&load, bytes, self.budget())
+            self.policy().would_admit_io(self, bytes)
         }
     }
 
@@ -587,9 +574,9 @@ impl WorkPool {
     // ---------------------------------------------------------------
 
     /// May another unit of work (file) be opened (see
-    /// `policy::may_open_unit`)?
+    /// [`Policy::may_open_unit`])?
     pub(super) fn may_open_unit(&self) -> bool {
-        policy::may_open_unit(&self.load(), self.budget())
+        self.policy().may_open_unit(self)
     }
 
     /// Register a newly opened file whose planner is being created outside
@@ -724,6 +711,43 @@ impl WorkPool {
             || self.can_plan(stream_reading)
             || self.can_start_io()
             || (!stream_reading && self.eligible_morsel_index().is_some())
+    }
+}
+
+/// What the pool holds, for the scheduling [`Policy`].
+impl PoolLoad for WorkPool {
+    fn streams(&self) -> usize {
+        self.config.streams
+    }
+    fn units(&self) -> usize {
+        self.units.len()
+    }
+    fn planning(&self) -> usize {
+        self.planning
+    }
+    fn ready_planners(&self) -> usize {
+        self.ready_planners.len()
+    }
+    fn unstarted_io(&self) -> usize {
+        self.unstarted_io.len()
+    }
+    fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+    fn in_flight_unknown(&self) -> usize {
+        self.in_flight_unknown
+    }
+    fn ready_morsels(&self) -> usize {
+        self.ready_morsels.len()
+    }
+    fn eligible_morsels(&self) -> usize {
+        self.eligible_morsel_count()
+    }
+    fn has_unsized_morsel(&self) -> bool {
+        self.ready_morsels.iter().any(|m| m.bytes.is_none())
+    }
+    fn readers(&self) -> usize {
+        self.active_readers
     }
 }
 
