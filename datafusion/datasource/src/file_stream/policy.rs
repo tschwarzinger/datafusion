@@ -10,6 +10,8 @@
 //! opened. Keeping the rules here, as functions of a [`Load`], keeps them in
 //! one place and testable without a pool.
 //!
+//! The module is private to `file_stream`, so its items are plain `pub`.
+//!
 //! [`WorkPool`]: super::work_pool::WorkPool
 
 use datafusion_execution::IoBudget;
@@ -20,30 +22,30 @@ const MAX_OPEN_UNITS_PER_STREAM: usize = 64;
 
 /// What a pool currently holds, as seen by the scheduling policy.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Load {
+pub struct Load {
     /// Streams driving the pool.
-    pub(super) streams: usize,
+    pub streams: usize,
     /// Open units of work (files or parts of files).
-    pub(super) units: usize,
+    pub units: usize,
     /// Planners and files being planned (CPU, outside the pool's lock).
-    pub(super) planning: usize,
+    pub planning: usize,
     /// CPU-ready planners.
-    pub(super) ready_planners: usize,
+    pub ready_planners: usize,
     /// I/O not started yet.
-    pub(super) unstarted_io: usize,
+    pub unstarted_io: usize,
     /// Started I/O.
-    pub(super) in_flight: usize,
+    pub in_flight: usize,
     /// Started I/O of unknown size (e.g. metadata reads).
-    pub(super) in_flight_unknown: usize,
+    pub in_flight_unknown: usize,
     /// Fetched morsels ready to be read.
-    pub(super) ready_morsels: usize,
+    pub ready_morsels: usize,
     /// Of those, the ones that may be read next (all, or for ordered reads
     /// those of the unit read next).
-    pub(super) eligible_morsels: usize,
+    pub eligible_morsels: usize,
     /// Whether a ready morsel does not report its size.
-    pub(super) unsized_morsel: bool,
+    pub unsized_morsel: bool,
     /// Morsels being read.
-    pub(super) readers: usize,
+    pub readers: usize,
 }
 
 impl Load {
@@ -64,7 +66,7 @@ impl Load {
 /// none, a scan makes progress when other scans of the query hold the whole
 /// budget, and an I/O larger than the budget still runs. Beyond the minimum,
 /// it starts if it fits the query's budget (prefetch).
-pub(super) fn admit_io(load: &Load, bytes: Option<usize>, budget: &IoBudget) -> bool {
+pub fn admit_io(load: &Load, bytes: Option<usize>, budget: &IoBudget) -> bool {
     let bytes = bytes.unwrap_or(0);
     if load.below_minimum() {
         budget.force_reserve(bytes);
@@ -74,16 +76,12 @@ pub(super) fn admit_io(load: &Load, bytes: Option<usize>, budget: &IoBudget) -> 
 }
 
 /// Like [`admit_io`], without reserving.
-pub(super) fn would_admit_io(
-    load: &Load,
-    bytes: Option<usize>,
-    budget: &IoBudget,
-) -> bool {
+pub fn would_admit_io(load: &Load, bytes: Option<usize>, budget: &IoBudget) -> bool {
     load.below_minimum() || budget.fits(bytes.unwrap_or(0))
 }
 
 /// May another unit of work (file) be opened?
-pub(super) fn may_open_unit(load: &Load, budget: &IoBudget) -> bool {
+pub fn may_open_unit(load: &Load, budget: &IoBudget) -> bool {
     // Nothing open, or the guaranteed minimum (one item of work per stream,
     // like each partition opening its own file without a budget).
     let work_items = load.planning
