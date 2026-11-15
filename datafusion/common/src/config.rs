@@ -1132,25 +1132,37 @@ config_namespace! {
         /// runtime reassignment occurs.
         pub enable_file_stream_work_stealing: bool, default = true
 
-        /// Budget, in bytes, for file scan I/O of a query that is in flight
-        /// or fetched but not yet decoded.
+        /// Budget, in bytes, for prefetching file scan I/O: the bytes of I/O
+        /// in flight plus fetched-but-not-yet-decoded data that the scans of
+        /// a query may hold *in addition to* what each scan partition reads
+        /// without prefetch. Default: 1 GiB. Set to `0` to disable prefetch.
         ///
         /// The budget is shared by all scans and all partitions of a query.
-        /// With `0` (the default) each scan partition has at most one I/O
-        /// outstanding, and fetching and decoding strictly alternate. With a
-        /// non-zero value, scans issue further I/O (the next row groups of a
-        /// Parquet file, further files) while they decode, as long as the bytes
-        /// of in-flight I/O plus fetched-but-not-yet-decoded data of the whole
-        /// query stay within this budget. Each scan partition may always have
-        /// one I/O in flight, as without a budget, so a small budget is never
-        /// slower than none and a scan never waits for budget held by another
-        /// scan. Scans that do not need to preserve order also split
-        /// files into independently fetched units (for Parquet: one per row
-        /// group), so a partition can fetch several row groups of a file
-        /// concurrently and idle partitions can take over work of busy ones.
-        /// Larger values help most on high-latency object stores. Ignored for
-        /// scans with a row limit.
-        pub scan_io_budget_bytes: usize, default = 0
+        ///
+        /// * `0`: no prefetch. Each scan partition has at most one I/O in
+        ///   flight, and fetching and decoding strictly alternate.
+        /// * `> 0`: scans issue further I/O while they decode (further row
+        ///   groups of a Parquet file, further files) as long as the query's
+        ///   prefetched bytes stay within the budget. Files are split into
+        ///   independently fetched units (for Parquet: one per row group), so
+        ///   a partition can fetch several row groups of a file concurrently.
+        ///   Scans that need not preserve order let idle partitions take over
+        ///   work of busy ones; scans that must preserve order (e.g. with an
+        ///   output ordering) read the prefetched units strictly in order.
+        ///
+        /// Memory: each scan partition may always have one unit of work (e.g.
+        /// one Parquet row group's projected columns) in flight, as without a
+        /// budget, so a small budget is never slower than none. The total held
+        /// by scans is therefore bounded by this budget plus one unit per scan
+        /// partition. Scans never read ahead further than the budget allows
+        /// (in particular not whole files), and prefetching does not grow until
+        /// the memory pool is full: the budget is not accounted in the
+        /// `MemoryPool`.
+        ///
+        /// Prefetch helps most on high-latency storage (object stores) and with
+        /// few partitions relative to the I/O latency. It is ignored for scans
+        /// with a row limit.
+        pub scan_io_budget_bytes: usize, default = 1024 * 1024 * 1024
 
         /// Aggregation ratio (number of distinct groups / number of input rows)
         /// threshold for skipping partial aggregation. If the value is greater

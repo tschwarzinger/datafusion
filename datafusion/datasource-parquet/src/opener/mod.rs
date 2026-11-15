@@ -747,6 +747,8 @@ impl Morsel for ParquetRowGroupMorsel {
 struct ParquetMorselPlanner {
     /// Ready to perform CPU-only planning work.
     state: ParquetOpenState,
+    /// See [`MorselPlanner::defer_planning`].
+    defer: bool,
 }
 
 impl fmt::Debug for ParquetMorselPlanner {
@@ -769,7 +771,10 @@ impl ParquetMorselPlanner {
         let state = ParquetOpenState::Start {
             prepared: Box::new(prepared),
         };
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            defer: false,
+        })
     }
 
     /// Schedule an I/O future that resolves to the next planner to run.
@@ -787,7 +792,10 @@ impl ParquetMorselPlanner {
     {
         let io_future = async move {
             let next_state = future.await?;
-            Ok(Box::new(ParquetMorselPlanner { state: next_state }) as _)
+            Ok(Box::new(ParquetMorselPlanner {
+                state: next_state,
+                defer: false,
+            }) as _)
         };
         MorselPlan::new().with_pending_planner(io_future)
     }
@@ -796,6 +804,12 @@ impl ParquetMorselPlanner {
 impl ParquetMorselPlanner {
     /// Drive the push decoder to the next row group or I/O boundary.
     fn plan_decode(mut state: Box<PushDecoderStreamState>) -> Result<Option<MorselPlan>> {
+        // A dynamic filter may have tightened since this work was planned:
+        // drop the last row group on its statistics before any further work
+        // for it (e.g. evaluating a row filter over its prefetched data).
+        if state.prune_last_row_group() {
+            return Ok(None);
+        }
         let step = state.next_step()?;
         // A dynamic filter may have tightened since the last morsel: stop
         // reading the file early if so, but only if there is work left (a
@@ -815,13 +829,18 @@ impl ParquetMorselPlanner {
                     // once it fits the scan's I/O budget, possibly long after
                     // it was planned.
                     let mut state = state;
-                    let state = if state.prune_pending_fetch() {
+                    let state = if state.prune_last_row_group() {
                         state
                     } else {
                         state.fetch(ranges).await?
                     };
+                    // The step after a fetch evaluates a pushed-down row
+                    // filter: defer it until the data is needed when the
+                    // filter can still tighten (e.g. TopK).
+                    let defer = state.defer_after_fetch;
                     Ok(Box::new(ParquetMorselPlanner {
                         state: ParquetOpenState::Decode(state),
+                        defer,
                     }) as Box<dyn MorselPlanner>)
                 };
                 Ok(Some(MorselPlan::new().with_pending(
@@ -836,6 +855,7 @@ impl ParquetMorselPlanner {
                 });
                 let next: Box<dyn MorselPlanner> = Box::new(ParquetMorselPlanner {
                     state: ParquetOpenState::Decode(state),
+                    defer: false,
                 });
                 Ok(Some(
                     MorselPlan::new()
@@ -849,6 +869,10 @@ impl ParquetMorselPlanner {
 }
 
 impl MorselPlanner for ParquetMorselPlanner {
+    fn defer_planning(&self) -> bool {
+        self.defer
+    }
+
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
         if matches!(self.state, ParquetOpenState::Done) {
             return Ok(None);
@@ -889,6 +913,7 @@ impl MorselPlanner for ParquetMorselPlanner {
                     .map(|state| {
                         Box::new(Self {
                             state: ParquetOpenState::Decode(Box::new(state)),
+                            defer: false,
                         }) as _
                     })
                     .collect();
@@ -896,10 +921,12 @@ impl MorselPlanner for ParquetMorselPlanner {
             }
             ParquetOpenState::Decode(state) => Self::plan_decode(state),
             ParquetOpenState::Done => Ok(None),
-            cpu_state => Ok(Some(
-                MorselPlan::new()
-                    .with_planners(vec![Box::new(Self { state: cpu_state })]),
-            )),
+            cpu_state => Ok(Some(MorselPlan::new().with_planners(vec![Box::new(
+                Self {
+                    state: cpu_state,
+                    defer: false,
+                },
+            )]))),
         }
     }
 }
@@ -1893,13 +1920,13 @@ impl RowGroupsPrunedParquetOpen {
         });
 
         // Split the scan into one decoder per row group when allowed, so the
-        // row groups can be fetched concurrently (and stolen by siblings).
-        // Splitting is only done when no limit applies, since the decoder
-        // limit is enforced per decoder.
-        let split = prepared.split_row_groups
-            && prepared.limit.is_none()
-            && !prepared.preserve_order
-            && rg_plan.len() > 1;
+        // row groups can be fetched concurrently (and, when order does not
+        // matter, read by any partition). The decoders are returned in scan
+        // order (after any reordering or reversal above), which `FileStream`
+        // follows when the order matters. Splitting is only done when no
+        // limit applies, since the decoder limit is enforced per decoder.
+        let split =
+            prepared.split_row_groups && prepared.limit.is_none() && rg_plan.len() > 1;
         let groups: Vec<(Vec<_>, VecDeque<RgPlanEntry>)> = if split {
             selections
                 .into_iter()
@@ -1931,6 +1958,18 @@ impl RowGroupsPrunedParquetOpen {
             }
             _ => None,
         };
+
+        // A pushed-down row filter containing a dynamic filter that can still
+        // change is evaluated when the decoder steps past the filter columns'
+        // I/O; defer that step until the data is needed, so the filter is
+        // as tight as possible (see `MorselPlanner::defer_planning`).
+        let defer_after_fetch = row_filter_context.is_some()
+            && prepared.predicate.as_ref().is_some_and(|predicate| {
+                matches!(
+                    DynamicFilterTracking::classify(predicate),
+                    DynamicFilterTracking::Watching(_)
+                )
+            });
 
         // One dynamic row-group pruner per file, shared by all its decoders
         // (and the morsels they produce, which re-check it before decoding).
@@ -2031,6 +2070,7 @@ impl RowGroupsPrunedParquetOpen {
                 row_filter_skipped_fully_matched,
                 byte_progress: group_progress,
                 fetched_bytes: 0,
+                defer_after_fetch,
             });
         }
         Ok(states)
@@ -4916,6 +4956,66 @@ mod test {
         // With reverse scan, row groups are reversed, so we expect:
         // Row group 3 (7,8,9), then row group 2 (4,5,6), then row group 1 (1,2,3)
         assert_eq!(reverse_values, vec![7, 8, 9, 4, 5, 6, 1, 2, 3]);
+    }
+
+    /// A file split into one decoder per row group returns the decoders in
+    /// scan order (after reversal / reordering), so `FileStream` can read them
+    /// in order when the scan must preserve it.
+    #[tokio::test]
+    async fn test_split_row_groups_keep_scan_order() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batches = vec![
+            record_batch!(("a", Int32, vec![1, 2, 3])).unwrap(),
+            record_batch!(("a", Int32, vec![4, 5, 6])).unwrap(),
+            record_batch!(("a", Int32, vec![7, 8, 9])).unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            batches,
+            Some(props),
+        )
+        .await;
+        let file = PartitionedFile::new("test.parquet", data_len as u64);
+
+        for (reverse, expected) in [
+            (false, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (true, vec![7, 8, 9, 4, 5, 6, 1, 2, 3]),
+        ] {
+            let mut opener = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_projection_indices(&[0])
+                .with_reverse_row_groups(reverse)
+                .with_preserve_order(true)
+                .build();
+            opener.set_split_files(true);
+
+            // the file is split into one planner per row group
+            let planner = opener.plan_file(file.clone()).unwrap();
+            let mut planners = VecDeque::from([planner]);
+            let split = loop {
+                let planner = planners.pop_front().unwrap();
+                let mut plan = planner.plan().unwrap().unwrap();
+                if let Some(io) = plan.take_pending_planner() {
+                    planners.push_front(io.await.unwrap());
+                    continue;
+                }
+                let ready = plan.take_ready_planners();
+                if ready.len() > 1 {
+                    break ready.len();
+                }
+                planners.extend(ready);
+            };
+            assert_eq!(split, 3, "one planner per row group");
+
+            let stream = open_file(&opener, file.clone()).await.unwrap();
+            assert_eq!(collect_int32_values(stream).await, expected);
+        }
     }
 
     #[tokio::test]

@@ -79,15 +79,15 @@ pub(super) struct PoolConfig {
 pub(super) struct WorkPool {
     config: PoolConfig,
     /// Open units of work, keyed by an increasing id (= planned order).
-    units: BTreeMap<u64, Unit>,
+    units: BTreeMap<UnitId, Unit>,
     next_unit: u64,
     next_io: u64,
     /// CPU-ready planners.
-    ready_planners: VecDeque<(u64, Box<dyn MorselPlanner>)>,
+    ready_planners: VecDeque<(UnitId, Box<dyn MorselPlanner>)>,
     /// Planners (or files) a stream is currently planning, outside the lock.
     planning: usize,
     /// Planner I/O that has not been started (polled) yet.
-    unstarted_io: VecDeque<(u64, PendingMorselPlanner)>,
+    unstarted_io: VecDeque<(UnitId, PendingMorselPlanner)>,
     /// Planner I/O that has been started.
     in_flight: Vec<InFlightIo>,
     /// Results of spawned I/O, not yet collected.
@@ -106,11 +106,23 @@ pub(super) struct WorkPool {
     wakers: Vec<Waker>,
 }
 
+/// Identifies a unit of work and defines the planned (read) order of units:
+/// files in the order they were opened, and the parts of a split file in the
+/// order its planner returned them, right after the file's first part and
+/// before any file opened later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct UnitId {
+    file: u64,
+    part: u32,
+}
+
 /// Book keeping for one unit of work.
 struct Unit {
     /// Number of planners, I/Os and morsels (ready or being read) alive for
     /// this unit.
     outstanding: usize,
+    /// Part number for the next part split off this unit.
+    next_part: u32,
     /// Whether finishing this unit counts as a processed file.
     counts_file: bool,
     /// Number of this unit's morsels being read.
@@ -119,14 +131,14 @@ struct Unit {
 
 /// A morsel ready to be read.
 pub(super) struct ReadyMorsel {
-    pub(super) unit: u64,
+    pub(super) unit: UnitId,
     pub(super) morsel: Box<dyn Morsel>,
     pub(super) bytes: usize,
 }
 
 struct InFlightIo {
     id: u64,
-    unit: u64,
+    unit: UnitId,
     bytes: Option<usize>,
     future: IoFuture,
 }
@@ -188,28 +200,50 @@ impl WorkPool {
     // Units
     // ---------------------------------------------------------------
 
-    fn new_unit(&mut self, counts_file: bool) -> u64 {
-        let id = self.next_unit;
+    /// A new unit for a file, ordered after all units opened so far.
+    fn new_unit(&mut self, counts_file: bool) -> UnitId {
+        let id = UnitId {
+            file: self.next_unit,
+            part: 0,
+        };
         self.next_unit += 1;
+        self.insert_unit(id, counts_file);
+        id
+    }
+
+    /// A new unit for a part split off `parent`, ordered after `parent` and
+    /// the parts split off it before, but before any later file.
+    fn new_part(&mut self, parent: UnitId) -> UnitId {
+        let unit = self.units.get_mut(&parent).expect("parent unit is open");
+        let id = UnitId {
+            file: parent.file,
+            part: unit.next_part,
+        };
+        unit.next_part += 1;
+        self.insert_unit(id, false);
+        id
+    }
+
+    fn insert_unit(&mut self, id: UnitId, counts_file: bool) {
         self.units.insert(
             id,
             Unit {
                 outstanding: 0,
+                next_part: id.part + 1,
                 counts_file,
                 reading: 0,
             },
         );
-        id
     }
 
-    fn add_outstanding(&mut self, unit: u64, n: usize) {
+    fn add_outstanding(&mut self, unit: UnitId, n: usize) {
         if let Some(u) = self.units.get_mut(&unit) {
             u.outstanding += n;
         }
     }
 
     /// Release one outstanding item of `unit`, finishing it at zero.
-    pub(super) fn release(&mut self, unit: u64, metrics: &mut FileStreamMetrics) {
+    pub(super) fn release(&mut self, unit: UnitId, metrics: &mut FileStreamMetrics) {
         let finished = match self.units.get_mut(&unit) {
             Some(u) => {
                 u.outstanding = u.outstanding.saturating_sub(1);
@@ -390,14 +424,53 @@ impl WorkPool {
 
     /// Is a planner ready and may it be planned now?
     fn can_plan(&self, stream_reading: bool) -> bool {
+        self.plannable_index(stream_reading).is_some()
+    }
+
+    /// Index of the ready planner to plan next, if planning is allowed now.
+    fn plannable_index(&self, stream_reading: bool) -> Option<usize> {
+        if self.ready_planners.is_empty() {
+            return None;
+        }
         // Legacy mode: plan only when there is nothing else to do, so I/O and
         // decoding strictly alternate.
-        !self.ready_planners.is_empty()
-            && !(self.legacy()
-                && (stream_reading
-                    || !self.ready_morsels.is_empty()
-                    || !self.in_flight.is_empty()
-                    || !self.unstarted_io.is_empty()))
+        if self.legacy()
+            && (stream_reading
+                || !self.ready_morsels.is_empty()
+                || !self.in_flight.is_empty()
+                || !self.unstarted_io.is_empty())
+        {
+            return None;
+        }
+        if let Some(idx) = self
+            .ready_planners
+            .iter()
+            .position(|(_, planner)| !planner.defer_planning())
+        {
+            return Some(idx);
+        }
+        // Only deferred planners are ready (see
+        // `MorselPlanner::defer_planning`): plan one only when a stream needs
+        // its output, i.e. it has nothing to read. With an ordered read that is
+        // only the planner of the unit read next: planning a later unit while
+        // the next one's I/O is still in flight would evaluate it too early.
+        if stream_reading || self.eligible_morsel_index().is_some() {
+            return None;
+        }
+        match self.config.read_order {
+            ReadOrder::Any => self
+                .ready_planners
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (unit, _))| *unit)
+                .map(|(idx, _)| idx),
+            ReadOrder::Preferred | ReadOrder::Required => {
+                let next = self.next_unit_to_read()?;
+                self.ready_planners
+                    .iter()
+                    .position(|(unit, _)| *unit == next)
+            }
+        }
     }
 
     /// Take a planner to plan outside the lock, if planning is allowed now.
@@ -406,11 +479,9 @@ impl WorkPool {
     pub(super) fn take_planner(
         &mut self,
         stream_reading: bool,
-    ) -> Option<(u64, Box<dyn MorselPlanner>)> {
-        if !self.can_plan(stream_reading) {
-            return None;
-        }
-        let planner = self.ready_planners.pop_front()?;
+    ) -> Option<(UnitId, Box<dyn MorselPlanner>)> {
+        let idx = self.plannable_index(stream_reading)?;
+        let planner = self.ready_planners.remove(idx).expect("index valid");
         self.planning += 1;
         Some(planner)
     }
@@ -419,7 +490,7 @@ impl WorkPool {
     /// [`Self::take_planner`].
     pub(super) fn finish_planning(
         &mut self,
-        unit: u64,
+        unit: UnitId,
         result: Result<Option<MorselPlan>>,
         metrics: &mut FileStreamMetrics,
         skip_errors: bool,
@@ -446,15 +517,17 @@ impl WorkPool {
         let mut planners = plan.take_ready_planners();
         let pending = plan.take_pending_planner();
 
-        // A planner that split its work into several independent planners
-        // (only done when the order is not required). When the planned order
-        // is preferred, give each part a unit of its own so "planned order"
-        // is well defined (see `eligible_morsel_index`).
-        if planners.len() > 1 && self.config.read_order == ReadOrder::Preferred {
+        // A planner that split its work into several independent planners.
+        // Unless any order will do, give each part a unit of its own, ordered
+        // right after `unit`: parts are then fetched concurrently (within the
+        // budget) but read strictly in planned order (see
+        // `eligible_morsel_index`), so a sorted scan can prefetch several row
+        // groups of a file and still release them in order.
+        if planners.len() > 1 && self.config.read_order != ReadOrder::Any {
             for planner in planners.split_off(1) {
-                let child = self.new_unit(false);
-                self.add_outstanding(child, 1);
-                self.ready_planners.push_back((child, planner));
+                let part = self.new_part(unit);
+                self.add_outstanding(part, 1);
+                self.ready_planners.push_back((part, planner));
             }
         }
 
@@ -528,7 +601,7 @@ impl WorkPool {
 
     /// Register a newly opened file whose planner is being created outside
     /// the lock. Returns its unit; finish with [`Self::finish_open`].
-    pub(super) fn begin_open(&mut self) -> u64 {
+    pub(super) fn begin_open(&mut self) -> UnitId {
         let unit = self.new_unit(true);
         self.add_outstanding(unit, 1);
         self.planning += 1;
@@ -538,7 +611,7 @@ impl WorkPool {
     /// Apply the result of creating the planner for `unit`.
     pub(super) fn finish_open(
         &mut self,
-        unit: u64,
+        unit: UnitId,
         planner: Result<Box<dyn MorselPlanner>>,
         metrics: &mut FileStreamMetrics,
         skip_errors: bool,
@@ -582,6 +655,15 @@ impl WorkPool {
         }
     }
 
+    /// The unit an ordered read reads next: the earliest unit no stream is
+    /// reading.
+    fn next_unit_to_read(&self) -> Option<UnitId> {
+        self.units
+            .iter()
+            .find(|(_, u)| u.reading == 0)
+            .map(|(id, _)| *id)
+    }
+
     /// Index of the next morsel that may be read.
     fn eligible_morsel_index(&self) -> Option<usize> {
         if self.ready_morsels.is_empty() {
@@ -594,7 +676,7 @@ impl WorkPool {
         // in production (= logical) order. Units are opened in the order the
         // work source and morselizer prioritized the work, so this reads in
         // planned order even though I/O may complete in any order.
-        let (&next, _) = self.units.iter().find(|(_, u)| u.reading == 0)?;
+        let next = self.next_unit_to_read()?;
         self.ready_morsels.iter().position(|m| m.unit == next)
     }
 
@@ -612,7 +694,7 @@ impl WorkPool {
     /// A morsel taken with [`Self::take_morsel`] has been read (or failed).
     pub(super) fn finish_read(
         &mut self,
-        unit: u64,
+        unit: UnitId,
         bytes: usize,
         metrics: &mut FileStreamMetrics,
     ) {

@@ -1467,14 +1467,20 @@ mod tests {
         .with_io_budget_bytes(1000)
     }
 
-    /// Without any ordering hint, the stream reads whichever morsel is ready
-    /// first instead of waiting for earlier work.
+    /// A pool driven by a single stream reads in planned order even without
+    /// any ordering hint, so a single partition returns rows in file order (as
+    /// without prefetch): later work is prefetched, but not read first.
     #[tokio::test]
-    async fn morsel_io_budget_reads_ready_morsel_first() -> Result<()> {
+    async fn morsel_io_budget_single_stream_reads_in_planned_order() -> Result<()> {
         let snapshot = slow_first_file(FileStreamMorselTest::new()).run().await?;
         assert!(
-            event_pos(&snapshot, "Batch: 42") < event_pos(&snapshot, "Batch: 41"),
-            "file2's morsel is ready first and should be read first:\n{snapshot}"
+            event_pos(&snapshot, "morsel_produced: file2.parquet")
+                < event_pos(&snapshot, "io_future_resolved: file1.parquet"),
+            "file2 should be prefetched while file1's I/O is in flight:\n{snapshot}"
+        );
+        assert!(
+            event_pos(&snapshot, "Batch: 41") < event_pos(&snapshot, "Batch: 42"),
+            "a single stream reads in planned order:\n{snapshot}"
         );
         Ok(())
     }
@@ -1724,19 +1730,7 @@ mod tests {
     /// a pool (which would be slower than no budget at all).
     #[tokio::test]
     async fn morsel_io_budget_floor_is_one_io_per_partition() -> Result<()> {
-        let file = |name: &str, io: usize, batch: i32| {
-            MockPlanner::builder(name)
-                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
-                    IoFutureId(io),
-                    PollsToResolve(5),
-                    100,
-                ))
-                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(io), batch))
-                .return_none()
-        };
-        let test = FileStreamMorselTest::new()
-            .with_file_in_partition(PartitionId(0), file("file1.parquet", 1, 41))
-            .with_file_in_partition(PartitionId(1), file("file2.parquet", 2, 42));
+        let test = one_file_per_partition();
         // far smaller than any I/O
         let budget = datafusion_execution::IoBudget::new(1);
         let metrics = ExecutionPlanMetricsSet::new();
@@ -1760,6 +1754,98 @@ mod tests {
         }
         assert_eq!(batches, 2);
         assert_eq!(budget.reserved(), 0);
+        Ok(())
+    }
+
+    /// Two partitions with one file each, whose I/O takes a few polls.
+    fn one_file_per_partition() -> FileStreamMorselTest {
+        let file = |name: &str, io: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(io),
+                    PollsToResolve(5),
+                    100,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(io), batch))
+                .return_none()
+        };
+        FileStreamMorselTest::new()
+            .with_file_in_partition(PartitionId(0), file("file1.parquet", 1, 41))
+            .with_file_in_partition(PartitionId(1), file("file2.parquet", 2, 42))
+    }
+
+    /// Without a budget, every partition has its own I/O in flight (one per
+    /// partition, as on main), not one for the whole scan.
+    #[tokio::test]
+    async fn morsel_no_io_budget_one_io_per_partition() -> Result<()> {
+        let test = one_file_per_partition();
+        let observer = test.morselizer.observer().clone();
+        observer.clear();
+        let metrics = ExecutionPlanMetricsSet::new();
+        let budget = datafusion_execution::IoBudget::new(0);
+        let mut streams = test.build_streams(&metrics, &budget)?;
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for stream in &mut streams {
+            assert!(stream.poll_next_unpin(&mut cx).is_pending());
+        }
+        let events = observer.format_events();
+        assert!(
+            events.contains("io_future_polled: file1.parquet")
+                && events.contains("io_future_polled: file2.parquet")
+                && !events.contains("io_future_resolved"),
+            "both partitions must have their I/O in flight:\n{events}"
+        );
+        Ok(())
+    }
+
+    /// When the order must be preserved, a file split into row groups has
+    /// its row groups fetched concurrently (within the budget) but read
+    /// strictly in order, and before any later file.
+    #[tokio::test]
+    async fn morsel_ordered_split_prefetches_but_reads_in_order() -> Result<()> {
+        let part = |name: &str, io: usize, polls: usize, batch: i32| -> MockPlanner {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_sized_pending_planner(
+                    IoFutureId(io),
+                    PollsToResolve(polls),
+                    10,
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(io), batch))
+                .return_none()
+                .into()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_file(
+                MockPlanner::builder("file1.parquet")
+                    .add_plan(MockPlanBuilder::new().with_ready_planners(vec![
+                        // the first row group's I/O is the slowest
+                        part("rg0", 10, 8, 41),
+                        part("rg1", 11, 4, 42),
+                        part("rg2", 12, 1, 43),
+                    ]))
+                    .return_none(),
+            )
+            .with_file(
+                MockPlanner::builder("file2.parquet")
+                    .add_plan(MockPlanBuilder::new().with_morsel(MorselId(20), 51))
+                    .return_none(),
+            )
+            .with_preserve_order(true)
+            .with_io_budget_bytes(1000);
+        let snapshot = test.run().await?;
+        assert!(
+            event_pos(&snapshot, "io_future_resolved: rg2")
+                < event_pos(&snapshot, "io_future_resolved: rg0"),
+            "row group I/O should run concurrently:\n{snapshot}"
+        );
+        let order: Vec<_> = ["Batch: 41", "Batch: 42", "Batch: 43", "Batch: 51"]
+            .iter()
+            .map(|b| event_pos(&snapshot, b))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "output must keep the planned order:\n{snapshot}"
+        );
         Ok(())
     }
 

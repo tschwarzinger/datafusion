@@ -93,12 +93,14 @@ pub trait Morselizer: Send + Sync + Debug {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>>;
 
     /// Allow (or disallow) this morselizer to split a file into several
-    /// independent [`MorselPlanner`]s (returned together from a single
-    /// [`MorselPlanner::plan`] call) whose morsels may be read in any order,
-    /// concurrently, or by sibling streams.
+    /// independent [`MorselPlanner`]s, returned together from a single
+    /// [`MorselPlanner::plan`] call in the file's logical order.
     ///
-    /// `FileStream` only enables this when the scan does not need to preserve
-    /// order and has an I/O budget. The default implementation ignores it.
+    /// `FileStream` enables this when the scan has an I/O budget. It may then
+    /// fetch the parts concurrently. When the scan must preserve order (or
+    /// prefers to, see [`Self::prefers_ordered_read`]), it reads the parts in
+    /// the order they were returned; otherwise it may read them in any order
+    /// and in any sibling stream. The default implementation ignores it.
     fn set_split_files(&mut self, _split: bool) {}
 
     /// Does reading this morsel's output in planned order make the scan
@@ -153,6 +155,22 @@ pub trait MorselPlanner: Send + Debug {
     ///
     /// See the comments on [`MorselPlan`] for the logical output order.
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>>;
+
+    /// Should planning this planner be deferred until its output is needed?
+    ///
+    /// `FileStream` normally plans ready planners eagerly, as soon as their
+    /// I/O completes, to discover further I/O and prepare morsels while other
+    /// morsels are decoded. A planner whose next CPU step makes decisions that
+    /// improve as the query progresses can return `true`: it is then planned
+    /// only when a stream needs work (it has nothing to read and no morsel is
+    /// ready), still after its I/O was prefetched. For example, a Parquet
+    /// decoder evaluates a pushed-down row filter in the step after the
+    /// filter columns arrive, and a TopK dynamic filter in that predicate
+    /// prunes far more rows once TopK has seen earlier rows. Defaults to
+    /// `false`.
+    fn defer_planning(&self) -> bool {
+        false
+    }
 }
 
 /// Return result of [`MorselPlanner::plan`].

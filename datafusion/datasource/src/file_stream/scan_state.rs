@@ -11,7 +11,7 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_physical_plan::metrics::ScopedTimerGuard;
 use futures::StreamExt as _;
 
-use super::work_pool::{PoolConfig, PoolStep, SharedPool, WorkPool};
+use super::work_pool::{PoolConfig, PoolStep, SharedPool, UnitId, WorkPool};
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError, StartableTime};
 
@@ -104,7 +104,7 @@ pub(super) struct ScanState {
 }
 
 struct ActiveReader {
-    unit: u64,
+    unit: UnitId,
     bytes: usize,
     stream: MorselStream,
 }
@@ -134,14 +134,25 @@ impl ScanState {
             config.io_budget = None;
         }
         let prefetch = config.io_budget.as_ref().is_some_and(|b| b.is_enabled());
-        let pool = match work_source.shared() {
-            Some(shared) if prefetch && config.read_order != ReadOrder::Required => {
-                shared.pool(config)
-            }
-            _ => WorkPool::new_shared(PoolConfig {
-                streams: 1,
-                ..config
-            }),
+        let shared = work_source
+            .shared()
+            .filter(|_| prefetch && config.read_order != ReadOrder::Required);
+        let streams = if shared.is_some() {
+            config.streams.max(1)
+        } else {
+            1
+        };
+        // A pool driven by a single stream reads in planned order: reading
+        // whatever is ready first only pays off when several streams share the
+        // work, and a single partition then returns rows in file order (as
+        // without prefetch) even though its I/O completes in any order.
+        if streams == 1 && config.read_order == ReadOrder::Any {
+            config.read_order = ReadOrder::Preferred;
+        }
+        let config = PoolConfig { streams, ..config };
+        let pool = match shared {
+            Some(shared) => shared.pool(config),
+            None => WorkPool::new_shared(config),
         };
         Self {
             work_source,

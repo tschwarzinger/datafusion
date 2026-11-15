@@ -478,7 +478,22 @@ impl ParquetIoTest {
     /// the first request reads only the footer metadata. Otherwise the default
     /// hint (512 KiB) covers the (small) test files entirely, hiding requests
     /// for the page index and Bloom filters.
-    pub(crate) async fn new(file_bytes: Bytes, mut config: SessionConfig) -> Self {
+    ///
+    /// Also disables I/O prefetch (`scan_io_budget_bytes = 0`): with prefetch,
+    /// requests run concurrently and are recorded in a non-deterministic
+    /// order. These tests document which bytes a query reads; see
+    /// [`Self::new_with_io_budget`] and [`Self::query_reads`] for prefetch.
+    pub(crate) async fn new(file_bytes: Bytes, config: SessionConfig) -> Self {
+        Self::new_with_io_budget(file_bytes, config, 0).await
+    }
+
+    /// Like [`Self::new`], with an I/O prefetch budget of `io_budget_bytes`.
+    pub(crate) async fn new_with_io_budget(
+        file_bytes: Bytes,
+        mut config: SessionConfig,
+        io_budget_bytes: usize,
+    ) -> Self {
+        config.options_mut().execution.scan_io_budget_bytes = io_budget_bytes;
         let file_size = file_bytes.len() as u64;
         let layout = ParquetFileLayout::new(&file_bytes);
         config.options_mut().execution.parquet.metadata_size_hint =
@@ -552,6 +567,24 @@ impl ParquetIoTest {
             let _ = writeln!(output, "{event}");
         }
         output
+    }
+}
+
+impl ParquetIoTest {
+    /// Runs `sql` and returns the byte ranges it read, sorted, without request
+    /// boundaries or output batches: comparable between scans whose requests
+    /// may be issued concurrently, in any order (I/O prefetch).
+    pub(crate) async fn query_reads(&self, sql: &str) -> Vec<String> {
+        let mut reads: Vec<_> = self
+            .query(sql)
+            .await
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("Read ") || line.starts_with("Head "))
+            .map(String::from)
+            .collect();
+        reads.sort();
+        reads
     }
 }
 

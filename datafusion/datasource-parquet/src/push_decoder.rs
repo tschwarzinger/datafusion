@@ -381,6 +381,10 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) byte_progress: ByteProgress,
     /// Bytes fetched since the last reader was handed out.
     pub(crate) fetched_bytes: usize,
+    /// Defer the step after each fetch until its output is needed, because
+    /// it evaluates a row filter with a dynamic filter that can still change
+    /// (see `MorselPlanner::defer_planning`).
+    pub(crate) defer_after_fetch: bool,
 }
 
 /// A fully fetched row group, decoded synchronously.
@@ -626,17 +630,18 @@ impl PushDecoderStreamState {
         self.decoder = None;
     }
 
-    /// Re-check the dynamic row-group pruner right before the decoder's
-    /// pending I/O is issued, which (with an I/O budget) can be well after the
-    /// I/O was planned.
+    /// Re-check the dynamic row-group pruner for the decoder's last remaining
+    /// row group, at the latest point before more work is done for it: right
+    /// before its I/O is issued, and before each further CPU step (e.g.
+    /// evaluating a row filter), both of which can happen well after the
+    /// work was planned when I/O is prefetched.
     ///
-    /// Returns `true` if the I/O can be skipped: the decoder is waiting for
-    /// data of its last remaining row group, and that row group can now be
-    /// pruned, so the decoder is finished without fetching it. (When more row
+    /// Returns `true` if the row group can now be pruned: the decoder is then
+    /// finished without fetching or evaluating anything more. (When more row
     /// groups follow, the decoder has already started this row group and can
     /// not drop it; it is then re-checked before decoding instead, see
     /// `LatePrune`.) Split decoders always hold a single row group.
-    pub(crate) fn prune_pending_fetch(&mut self) -> bool {
+    pub(crate) fn prune_last_row_group(&mut self) -> bool {
         let (Some(pruner), Some(next)) =
             (self.row_group_pruner.as_ref(), self.rg_plan.front())
         else {

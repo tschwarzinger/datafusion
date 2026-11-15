@@ -19,7 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::prelude::{
-    CsvReadOptions, JsonReadOptions, ParquetReadOptions, SessionContext,
+    CsvReadOptions, JsonReadOptions, ParquetReadOptions, SessionConfig, SessionContext,
 };
 use datafusion_catalog_listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion_common::assert_batches_eq;
@@ -1114,7 +1114,12 @@ struct Test {
 impl Test {
     fn new() -> Self {
         let object_store = Arc::new(RequestCountingObjectStore::new());
-        let session_context = SessionContext::new();
+        // These tests document the exact object store requests of a query.
+        // Disable I/O prefetch: with it, requests are issued concurrently and
+        // recorded in a non-deterministic order.
+        let mut config = SessionConfig::new();
+        config.options_mut().execution.scan_io_budget_bytes = 0;
+        let session_context = SessionContext::new_with_config(config);
         session_context
             .runtime_env()
             .register_object_store(&Url::parse("mem://").unwrap(), object_store.clone());

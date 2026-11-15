@@ -130,10 +130,11 @@ impl<'a> FileStreamBuilder<'a> {
         let io_budget =
             io_budget.filter(|budget| budget.is_enabled() && config.limit.is_none());
         // With prefetch, split files into independent morsels (e.g. one per
-        // Parquet row group) when the order does not matter: this is what
-        // lets a scan fetch several parts of a file concurrently and lets
-        // partitions balance the work.
-        let split = io_budget.is_some() && !preserve_order;
+        // Parquet row group): this is what lets a scan fetch several parts of
+        // a file concurrently and lets partitions balance the work. Scans that
+        // must preserve order split too: the parts are fetched concurrently
+        // but read strictly in planned order.
+        let split = io_budget.is_some();
         morselizer.set_split_files(split);
         let read_order = if preserve_order {
             ReadOrder::Required

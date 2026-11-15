@@ -123,6 +123,36 @@ async fn test_row_group_pruning_io_all_pruned() {
 }
 
 /// Returns a [`ParquetIoTest`] for the file described in the module docs
+/// With I/O prefetch (the default budget), the same byte ranges are read as
+/// without it: prefetch changes when (and how concurrently) data is fetched,
+/// not what is fetched.
+#[tokio::test]
+async fn test_row_group_pruning_io_prefetch_reads_the_same_ranges() {
+    let config = || {
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_parquet_pruning(true)
+    };
+    let without = ParquetIoTest::new(three_row_group_file(), config()).await;
+    let with = ParquetIoTest::new_with_io_budget(
+        three_row_group_file(),
+        config(),
+        1024 * 1024 * 1024,
+    )
+    .await;
+    for sql in [
+        "SELECT * FROM t",
+        "SELECT * FROM t WHERE id = 5",
+        "SELECT * FROM t WHERE id > 5",
+    ] {
+        assert_eq!(
+            with.query_reads(sql).await,
+            without.query_reads(sql).await,
+            "{sql}"
+        );
+    }
+}
+
 async fn row_group_pruning_test() -> ParquetIoTest {
     let config = SessionConfig::new()
         .with_target_partitions(1)
