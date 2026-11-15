@@ -8,7 +8,7 @@ use crate::file_scan_config::FileScanConfig;
 use crate::file_stream::scan_state::{ReadOrder, ScanState};
 use crate::file_stream::work_pool::PoolConfig;
 use crate::file_stream::work_source::{SharedWorkSource, WorkSource};
-use crate::morsel::{FileOpenerMorselizer, Morselizer};
+use crate::morsel::{FileOpenerMorselizer, Morselizer, MorselizerOptions};
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::IoBudget;
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
@@ -127,18 +127,22 @@ impl<'a> FileStreamBuilder<'a> {
         };
 
         let preserve_order = config.preserves_file_order();
-        let io_budget =
-            io_budget.filter(|budget| budget.is_enabled() && config.limit.is_none());
+        // no prefetch without a budget, or with a limit (don't read ahead data
+        // that will not be needed)
+        let io_budget = io_budget
+            .filter(|budget| config.limit.is_none() && budget.is_enabled())
+            .unwrap_or_else(|| IoBudget::new(0));
         // With prefetch, split files into independent morsels (e.g. one per
         // Parquet row group): this is what lets a scan fetch several parts of
         // a file concurrently and lets partitions balance the work. Scans that
         // must preserve order split too: the parts are fetched concurrently
         // but read strictly in planned order.
-        let split = io_budget.is_some();
-        morselizer.set_split_files(split);
+        let properties = morselizer.configure(&MorselizerOptions {
+            split_files: io_budget.is_enabled(),
+        });
         let read_order = if preserve_order {
             ReadOrder::Required
-        } else if morselizer.prefers_ordered_read() {
+        } else if properties.prefers_ordered_read {
             ReadOrder::Preferred
         } else {
             ReadOrder::Any

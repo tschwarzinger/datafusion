@@ -1135,7 +1135,7 @@ config_namespace! {
         /// Budget, in bytes, for prefetching file scan I/O: the bytes of I/O
         /// in flight plus fetched-but-not-yet-decoded data that the scans of
         /// a query may hold *in addition to* what each scan partition reads
-        /// without prefetch. Default: 1 GiB. Set to `0` to disable prefetch.
+        /// without prefetch. Default: 256 MiB. Set to `0` to disable prefetch.
         ///
         /// The budget is shared by all scans and all partitions of a query.
         ///
@@ -1162,7 +1162,7 @@ config_namespace! {
         /// Prefetch helps most on high-latency storage (object stores) and with
         /// few partitions relative to the I/O latency. It is ignored for scans
         /// with a row limit.
-        pub scan_io_budget_bytes: usize, default = 1024 * 1024 * 1024
+        pub scan_io_budget_bytes: usize, default = 256 * 1024 * 1024
 
         /// Aggregation ratio (number of distinct groups / number of input rows)
         /// threshold for skipping partial aggregation. If the value is greater

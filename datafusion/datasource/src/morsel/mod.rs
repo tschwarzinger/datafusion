@@ -68,15 +68,78 @@ pub trait Morsel: Send + Debug {
     /// their data should return [`MorselStream::Sync`].
     fn into_stream(self: Box<Self>) -> Result<MorselStream>;
 
-    /// Number of bytes of already-fetched (buffered) input this morsel holds
-    /// until it has been fully consumed.
-    ///
-    /// This is used to bound the amount of fetched-but-not-yet-decoded data
-    /// a scan keeps in memory when it issues I/O ahead of decoding (see
-    /// `datafusion.execution.scan_io_budget_bytes`). Returns `0` by default.
-    fn buffered_bytes(&self) -> usize {
-        0
+    /// Scheduling information: [`WorkInfo::bytes`] is the fetched data this
+    /// morsel holds until it has been consumed. Unknown by default.
+    fn info(&self) -> WorkInfo {
+        WorkInfo::default()
     }
+}
+
+/// Scheduling information about an item of morsel work (a pending I/O, a
+/// planner or a morsel), which `FileStream` uses to bound and order work it
+/// does ahead of time (see `datafusion.execution.scan_io_budget_bytes`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkInfo {
+    /// The data the item accounts for, if known: for a pending I/O the bytes
+    /// it will fetch, for a morsel the fetched bytes it holds until consumed.
+    ///
+    /// `FileStream` charges known sizes against the query's I/O budget. Work
+    /// of unknown size is not charged, but limits how much further work is
+    /// started (e.g. no further files are opened in bursts while metadata of
+    /// unknown size is being read).
+    pub bytes: Option<usize>,
+    /// Planners only: plan this planner only when its output is needed (a
+    /// stream has nothing to read), rather than eagerly when it is ready.
+    ///
+    /// For planners whose next CPU step makes decisions that improve as the
+    /// query progresses. For example, a Parquet decoder evaluates a pushed
+    /// down row filter in the step after the filter columns arrive, and a
+    /// TopK dynamic filter in that predicate prunes far more rows once TopK
+    /// has seen earlier rows. Any I/O is still prefetched.
+    pub defer: bool,
+}
+
+impl WorkInfo {
+    /// Information about an item of `bytes` bytes.
+    pub fn with_bytes(bytes: usize) -> Self {
+        Self {
+            bytes: Some(bytes),
+            defer: false,
+        }
+    }
+
+    /// Set [`Self::defer`].
+    pub fn with_defer(mut self, defer: bool) -> Self {
+        self.defer = defer;
+        self
+    }
+}
+
+/// How `FileStream` will consume a [`Morselizer`]'s output, see
+/// [`Morselizer::configure`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MorselizerOptions {
+    /// The morselizer may split a file into several independent
+    /// [`MorselPlanner`]s, returned together from a single
+    /// [`MorselPlanner::plan`] call in the file's logical order.
+    ///
+    /// `FileStream` may then fetch the parts concurrently. When the scan must
+    /// preserve order (or the morselizer prefers it, see
+    /// [`MorselizerProperties::prefers_ordered_read`]) it reads them in the
+    /// order they were returned; otherwise in any order and in any sibling
+    /// stream.
+    pub split_files: bool,
+}
+
+/// Properties of a [`Morselizer`]'s output, see [`Morselizer::configure`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MorselizerProperties {
+    /// Reading the output in planned order makes the scan cheaper, even
+    /// though any order is correct: for example a Parquet scan whose row
+    /// groups were reordered so that a TopK dynamic filter tightens as early
+    /// as possible. `FileStream` then still prefetches (and may split and
+    /// share) work, but consumes it in planned order.
+    pub prefers_ordered_read: bool,
 }
 
 /// A Morselizer takes a single [`PartitionedFile`] and creates the initial planner
@@ -92,26 +155,11 @@ pub trait Morselizer: Send + Sync + Debug {
     /// [`MorselPlan::with_pending_planner`].
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>>;
 
-    /// Allow (or disallow) this morselizer to split a file into several
-    /// independent [`MorselPlanner`]s, returned together from a single
-    /// [`MorselPlanner::plan`] call in the file's logical order.
-    ///
-    /// `FileStream` enables this when the scan has an I/O budget. It may then
-    /// fetch the parts concurrently. When the scan must preserve order (or
-    /// prefers to, see [`Self::prefers_ordered_read`]), it reads the parts in
-    /// the order they were returned; otherwise it may read them in any order
-    /// and in any sibling stream. The default implementation ignores it.
-    fn set_split_files(&mut self, _split: bool) {}
-
-    /// Does reading this morsel's output in planned order make the scan
-    /// cheaper, even though any order is correct?
-    ///
-    /// For example, a Parquet scan whose row groups were reordered so that a
-    /// TopK dynamic filter tightens as early as possible. `FileStream` then
-    /// still prefetches (and may split / share) work, but consumes it in
-    /// planned order. Defaults to `false`.
-    fn prefers_ordered_read(&self) -> bool {
-        false
+    /// Tell the morselizer how its output will be consumed and get its
+    /// properties. Called once by `FileStream` before any file is planned.
+    /// The default ignores the options and has default properties.
+    fn configure(&mut self, _options: &MorselizerOptions) -> MorselizerProperties {
+        MorselizerProperties::default()
     }
 }
 
@@ -156,20 +204,10 @@ pub trait MorselPlanner: Send + Debug {
     /// See the comments on [`MorselPlan`] for the logical output order.
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>>;
 
-    /// Should planning this planner be deferred until its output is needed?
-    ///
-    /// `FileStream` normally plans ready planners eagerly, as soon as their
-    /// I/O completes, to discover further I/O and prepare morsels while other
-    /// morsels are decoded. A planner whose next CPU step makes decisions that
-    /// improve as the query progresses can return `true`: it is then planned
-    /// only when a stream needs work (it has nothing to read and no morsel is
-    /// ready), still after its I/O was prefetched. For example, a Parquet
-    /// decoder evaluates a pushed-down row filter in the step after the
-    /// filter columns arrive, and a TopK dynamic filter in that predicate
-    /// prunes far more rows once TopK has seen earlier rows. Defaults to
-    /// `false`.
-    fn defer_planning(&self) -> bool {
-        false
+    /// Scheduling information, see [`WorkInfo::defer`]. `FileStream`
+    /// otherwise plans ready planners eagerly. Default: not deferred.
+    fn info(&self) -> WorkInfo {
+        WorkInfo::default()
     }
 }
 
@@ -223,7 +261,7 @@ impl MorselPlan {
     }
 
     /// Set an already constructed pending planner (e.g. one carrying an
-    /// [`PendingMorselPlanner::with_io_bytes`] hint).
+    /// [`PendingMorselPlanner::with_info`]).
     pub fn with_pending(mut self, pending: PendingMorselPlanner) -> Self {
         self.pending_planner = Some(pending);
         self
@@ -265,8 +303,8 @@ impl MorselPlan {
 /// budget.
 pub struct PendingMorselPlanner {
     future: BoxFuture<'static, Result<Box<dyn MorselPlanner>>>,
-    /// Number of bytes this I/O will fetch, if known.
-    io_bytes: Option<usize>,
+    /// Scheduling information, see [`WorkInfo::bytes`].
+    info: WorkInfo,
 }
 
 impl PendingMorselPlanner {
@@ -291,24 +329,20 @@ impl PendingMorselPlanner {
     {
         Self {
             future: future.boxed(),
-            io_bytes: None,
+            info: WorkInfo::default(),
         }
     }
 
-    /// Record how many bytes this I/O is expected to fetch.
-    ///
-    /// When known, `FileStream` charges this amount against its I/O budget
-    /// while the I/O is in flight. I/O of unknown size (e.g. metadata reads)
-    /// is not charged, but `FileStream` will not start planning additional
-    /// files while such I/O is outstanding.
-    pub fn with_io_bytes(mut self, io_bytes: usize) -> Self {
-        self.io_bytes = Some(io_bytes);
+    /// Set the scheduling information, e.g. how many bytes this I/O will
+    /// fetch ([`WorkInfo::with_bytes`]).
+    pub fn with_info(mut self, info: WorkInfo) -> Self {
+        self.info = info;
         self
     }
 
-    /// Number of bytes this I/O is expected to fetch, if known.
-    pub fn io_bytes(&self) -> Option<usize> {
-        self.io_bytes
+    /// Scheduling information.
+    pub fn info(&self) -> WorkInfo {
+        self.info
     }
 
     /// Consume this wrapper and return the underlying future.

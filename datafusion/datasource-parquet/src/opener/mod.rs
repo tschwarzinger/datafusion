@@ -26,7 +26,8 @@ use crate::{
 };
 use arrow::datatypes::DataType;
 use datafusion_datasource::morsel::{
-    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, PendingMorselPlanner,
+    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, MorselizerOptions,
+    MorselizerProperties, PendingMorselPlanner, WorkInfo,
 };
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::rewrite::rewrite_input_file_name_in_projection;
@@ -302,7 +303,7 @@ pub(super) struct ParquetMorselizer {
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
     /// Split files into one independent planner per row group (see
-    /// [`Morselizer::set_split_files`]).
+    /// [`MorselizerOptions::split_files`]).
     pub(crate) split_row_groups: bool,
 }
 
@@ -322,14 +323,14 @@ impl Morselizer for ParquetMorselizer {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
     }
 
-    fn set_split_files(&mut self, split: bool) {
-        self.split_row_groups = split;
-    }
-
-    fn prefers_ordered_read(&self) -> bool {
-        // Row groups (and files) are reordered for sort pushdown so that a
-        // TopK dynamic filter tightens as early as possible.
-        self.sort_order_for_reorder.is_some() || self.reverse_row_groups
+    fn configure(&mut self, options: &MorselizerOptions) -> MorselizerProperties {
+        self.split_row_groups = options.split_files;
+        MorselizerProperties {
+            // Row groups (and files) are reordered for sort pushdown so that
+            // a TopK dynamic filter tightens as early as possible.
+            prefers_ordered_read: self.sort_order_for_reorder.is_some()
+                || self.reverse_row_groups,
+        }
     }
 }
 
@@ -738,8 +739,8 @@ impl Morsel for ParquetRowGroupMorsel {
         Ok(MorselStream::Sync(Box::new(self.reader)))
     }
 
-    fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
+    fn info(&self) -> WorkInfo {
+        WorkInfo::with_bytes(self.buffered_bytes)
     }
 }
 
@@ -830,9 +831,12 @@ impl ParquetMorselPlanner {
                         state: ParquetOpenState::Decode(state),
                     }) as Box<dyn MorselPlanner>)
                 };
-                Ok(Some(MorselPlan::new().with_pending(
-                    PendingMorselPlanner::new(io_future).with_io_bytes(io_bytes),
-                )))
+                Ok(Some(
+                    MorselPlan::new().with_pending(
+                        PendingMorselPlanner::new(io_future)
+                            .with_info(WorkInfo::with_bytes(io_bytes)),
+                    ),
+                ))
             }
             DecodeStep::Reader(reader) => {
                 let buffered_bytes = mem::take(&mut state.fetched_bytes);
@@ -855,12 +859,9 @@ impl ParquetMorselPlanner {
 }
 
 impl MorselPlanner for ParquetMorselPlanner {
-    fn defer_planning(&self) -> bool {
-        // The step after a fetch evaluates a pushed-down row filter: defer it
-        // until its output is needed when the filter can still tighten (e.g.
-        // TopK). Fetched data no step has used yet marks that step.
-        matches!(&self.state, ParquetOpenState::Decode(state)
-            if state.defer_after_fetch && state.fetched_bytes > 0)
+    fn info(&self) -> WorkInfo {
+        WorkInfo::default().with_defer(matches!(&self.state,
+            ParquetOpenState::Decode(state) if state.defer_next()))
     }
 
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>> {
@@ -1949,7 +1950,7 @@ impl RowGroupsPrunedParquetOpen {
         // A pushed-down row filter containing a dynamic filter that can still
         // change is evaluated when the decoder steps past the filter columns'
         // I/O; defer that step until the data is needed, so the filter is
-        // as tight as possible (see `MorselPlanner::defer_planning`).
+        // as tight as possible (see `WorkInfo::defer`).
         let defer_after_fetch = row_filter_context.is_some()
             && prepared.predicate.as_ref().is_some_and(|predicate| {
                 matches!(
@@ -2058,6 +2059,7 @@ impl RowGroupsPrunedParquetOpen {
                 byte_progress: group_progress,
                 fetched_bytes: 0,
                 defer_after_fetch,
+                emitted_reader: false,
             });
         }
         Ok(states)
@@ -2839,7 +2841,7 @@ mod test {
                             self.planners.push_front(p);
                         }
                         if let Some(pending_planner) = plan.take_pending_planner() {
-                            if stop_at_data_io && pending_planner.io_bytes().is_some() {
+                            if stop_at_data_io && pending_planner.info().bytes.is_some() {
                                 self.deferred = Some(pending_planner);
                                 return Ok(true);
                             }
@@ -3168,7 +3170,7 @@ mod test {
                 .with_metrics(metrics.clone())
                 .build();
             morselizer.batch_size = 1;
-            morselizer.set_split_files(split);
+            morselizer.configure(&MorselizerOptions { split_files: split });
             (dynamic, morselizer)
         }
 
@@ -3380,7 +3382,7 @@ mod test {
                 .with_predicate(Arc::clone(&dynamic) as _)
                 .with_metrics(metrics.clone())
                 .build();
-            morselizer.set_split_files(true);
+            morselizer.configure(&MorselizerOptions { split_files: true });
 
             let mut planners = VecDeque::from([morselizer.plan_file(file).unwrap()]);
             let mut data_io = vec![];
@@ -3395,7 +3397,7 @@ mod test {
                     morsels.extend(plan.take_morsels());
                     planners.extend(plan.take_ready_planners());
                     if let Some(io) = plan.take_pending_planner() {
-                        if io.io_bytes().is_some() {
+                        if io.info().bytes.is_some() {
                             data_io.push(io);
                         } else {
                             planners.push_front(io.await.unwrap());
@@ -4980,7 +4982,7 @@ mod test {
                 .with_reverse_row_groups(reverse)
                 .with_preserve_order(true)
                 .build();
-            opener.set_split_files(true);
+            opener.configure(&MorselizerOptions { split_files: true });
 
             // the file is split into one planner per row group
             let planner = opener.plan_file(file.clone()).unwrap();

@@ -58,7 +58,7 @@ impl WorkSource {
 /// sibling streams for that execution. Whichever stream becomes idle first may
 /// take the next unopened file from the front of the queue.
 ///
-/// When the scan has an I/O budget, the siblings additionally share one
+/// When order is not required, the siblings additionally share one
 /// [`WorkPool`] holding all work that was opened but not yet read (planners,
 /// in-flight I/O, fetched morsels), so any stream can drive any of it.
 ///
@@ -72,7 +72,7 @@ pub(crate) struct SharedWorkSource {
 #[derive(Default)]
 pub(super) struct SharedWorkSourceInner {
     files: Mutex<VecDeque<PartitionedFile>>,
-    /// Work pool shared by all siblings (budgeted scans only).
+    /// Work pool shared by all siblings (scans that need not keep order).
     pool: OnceLock<SharedPool>,
 }
 

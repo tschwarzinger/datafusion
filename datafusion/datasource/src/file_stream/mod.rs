@@ -10,6 +10,7 @@
 
 mod builder;
 mod metrics;
+mod policy;
 mod scan_state;
 mod work_pool;
 pub(crate) mod work_source;
@@ -831,8 +832,10 @@ mod tests {
 
         // The key events are:
         // 1. the first `planner_called` produces `MorselId(10)` and creates `IoFutureId(1)`
-        // 2. `MorselId(10)` continues yielding both batches while that I/O is pending
-        // 3. after the I/O resolves, planning resumes and yields `MorselId(11)`
+        // 2. `MorselId(10)` yields both batches while that I/O is pending
+        // 3. without a budget the I/O only starts once the morsel is read
+        //    (each partition has one unit of work: fetch and decode alternate)
+        // 4. after the I/O resolves, planning resumes and yields `MorselId(11)`
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Output Stream -----
         Batch: 41
@@ -845,15 +848,15 @@ mod tests {
         planner_called: file1.parquet
         morsel_produced: file1.parquet, MorselId(10)
         io_future_created: file1.parquet, IoFutureId(1)
-        io_future_polled: file1.parquet, IoFutureId(1)
         morsel_stream_started: MorselId(10)
-        io_future_polled: file1.parquet, IoFutureId(1)
         morsel_stream_batch_produced: MorselId(10), BatchId(41)
-        io_future_polled: file1.parquet, IoFutureId(1)
         morsel_stream_batch_produced: MorselId(10), BatchId(42)
+        morsel_stream_finished: MorselId(10)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
         io_future_polled: file1.parquet, IoFutureId(1)
         io_future_resolved: file1.parquet, IoFutureId(1)
-        morsel_stream_finished: MorselId(10)
         planner_called: file1.parquet
         morsel_produced: file1.parquet, MorselId(11)
         morsel_stream_started: MorselId(11)
@@ -1788,11 +1791,14 @@ mod tests {
         for stream in &mut streams {
             assert!(stream.poll_next_unpin(&mut cx).is_pending());
         }
+        // let the spawned I/O run
+        tokio::task::yield_now().await;
         let events = observer.format_events();
+        // both I/Os were started before either completed
+        let first_resolved = events.find("io_future_resolved").unwrap_or(events.len());
         assert!(
-            events.contains("io_future_polled: file1.parquet")
-                && events.contains("io_future_polled: file2.parquet")
-                && !events.contains("io_future_resolved"),
+            events[..first_resolved].contains("io_future_polled: file1.parquet")
+                && events[..first_resolved].contains("io_future_polled: file2.parquet"),
             "both partitions must have their I/O in flight:\n{events}"
         );
         Ok(())

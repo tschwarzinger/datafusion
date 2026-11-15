@@ -12,7 +12,8 @@ use std::task::{Context, Poll};
 
 use crate::PartitionedFile;
 use crate::morsel::{
-    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, PendingMorselPlanner,
+    Morsel, MorselPlan, MorselPlanner, MorselStream, Morselizer, MorselizerOptions,
+    MorselizerProperties, PendingMorselPlanner, WorkInfo,
 };
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -229,7 +230,7 @@ struct MockPendingPlanner {
     io_future_id: IoFutureId,
     polls_to_resolve: PollsToResolve,
     result: std::result::Result<(), MockError>,
-    /// Optional `PendingMorselPlanner::with_io_bytes` hint.
+    /// Optional size of the I/O (`WorkInfo::bytes`).
     io_bytes: Option<usize>,
 }
 
@@ -448,7 +449,7 @@ impl MockMorselizer {
         self
     }
 
-    /// Set the [`Morselizer::prefers_ordered_read`] hint.
+    /// Set [`MorselizerProperties::prefers_ordered_read`].
     pub(crate) fn with_prefers_ordered_read(mut self, prefers: bool) -> Self {
         self.prefers_ordered_read = prefers;
         self
@@ -456,8 +457,10 @@ impl MockMorselizer {
 }
 
 impl Morselizer for MockMorselizer {
-    fn prefers_ordered_read(&self) -> bool {
-        self.prefers_ordered_read
+    fn configure(&mut self, _options: &MorselizerOptions) -> MorselizerProperties {
+        MorselizerProperties {
+            prefers_ordered_read: self.prefers_ordered_read,
+        }
     }
 
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
@@ -617,7 +620,7 @@ impl MorselPlanner for MockMorselPlanner {
                     .boxed();
                     let mut pending = PendingMorselPlanner::new(io_future);
                     if let Some(io_bytes) = io_bytes {
-                        pending = pending.with_io_bytes(io_bytes);
+                        pending = pending.with_info(WorkInfo::with_bytes(io_bytes));
                     }
                     plan = plan.with_pending(pending);
                 }

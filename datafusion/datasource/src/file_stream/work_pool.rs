@@ -18,10 +18,7 @@ use crate::morsel::{Morsel, MorselPlan, MorselPlanner, PendingMorselPlanner};
 use datafusion_execution::IoBudget;
 
 use super::FileStreamMetrics;
-
-/// Maximum number of units of work open per stream sharing a pool,
-/// regardless of the I/O budget.
-const MAX_OPEN_UNITS_PER_STREAM: usize = 64;
+use super::policy::{self, Load};
 
 /// A [`WorkPool`] that may be shared by sibling streams.
 pub(super) type SharedPool = Arc<Mutex<WorkPool>>;
@@ -46,10 +43,10 @@ pub(super) enum ReadOrder {
 /// Configuration of a [`WorkPool`].
 #[derive(Debug, Clone)]
 pub(super) struct PoolConfig {
-    /// Query-wide budget for in-flight I/O plus fetched-but-not-yet-read
-    /// morsels. `None` (or a disabled budget) means a single outstanding I/O
-    /// at a time (legacy mode).
-    pub(super) io_budget: Option<Arc<IoBudget>>,
+    /// Query-wide budget for prefetching: in-flight I/O plus fetched but not
+    /// yet read morsels beyond the guaranteed minimum (see `policy`). A zero
+    /// budget means no prefetch.
+    pub(super) io_budget: Arc<IoBudget>,
     pub(super) read_order: ReadOrder,
     /// Number of streams driving this pool.
     pub(super) streams: usize,
@@ -66,7 +63,7 @@ pub(super) struct PoolConfig {
 /// **any** stream can drive **any** outstanding item:
 ///
 /// * Started I/O runs as a spawned task that delivers its result back into
-///   the pool and wakes all waiting streams, so it completes without any
+///   the pool and wakes a waiting stream, so it completes without any
 ///   particular stream being polled.
 /// * A stream only finishes once the pool has nothing left it could drive and
 ///   no unopened files remain, rather than as soon as the queue of unopened
@@ -102,8 +99,11 @@ pub(super) struct WorkPool {
     in_flight_unknown: usize,
     /// Sum of `buffered_bytes` of ready morsels and morsels being read.
     buffered_bytes: usize,
-    /// Streams waiting for work.
-    wakers: Vec<Waker>,
+    /// Streams waiting for work (by [`Self::new_waiter`] id), in the order
+    /// they started waiting; at most one entry per stream.
+    wakers: VecDeque<(usize, Waker)>,
+    /// Next id handed out by [`Self::new_waiter`].
+    next_waiter: usize,
 }
 
 /// Identifies a unit of work and defines the planned (read) order of units:
@@ -133,7 +133,8 @@ struct Unit {
 pub(super) struct ReadyMorsel {
     pub(super) unit: UnitId,
     pub(super) morsel: Box<dyn Morsel>,
-    pub(super) bytes: usize,
+    /// Fetched bytes it holds, if known (`WorkInfo::bytes`).
+    pub(super) bytes: Option<usize>,
 }
 
 struct InFlightIo {
@@ -144,8 +145,8 @@ struct InFlightIo {
 }
 
 enum IoFuture {
-    /// Polled inline by whichever stream drives the pool (legacy mode, or no
-    /// Tokio runtime available).
+    /// Polled inline by whichever stream drives the pool (no Tokio runtime
+    /// available).
     Inline(PendingMorselPlanner),
     /// Spawned onto the Tokio runtime; delivers its result into `completed`.
     /// Kept so the task is aborted if the pool is dropped.
@@ -179,7 +180,8 @@ impl WorkPool {
             in_flight_bytes: 0,
             in_flight_unknown: 0,
             buffered_bytes: 0,
-            wakers: Vec::new(),
+            wakers: VecDeque::new(),
+            next_waiter: 0,
         }
     }
 
@@ -187,13 +189,25 @@ impl WorkPool {
         Arc::new(Mutex::new(Self::new(config)))
     }
 
-    fn legacy(&self) -> bool {
-        self.budget().is_none()
+    fn budget(&self) -> &IoBudget {
+        &self.config.io_budget
     }
 
-    /// The query-wide budget, if prefetching is enabled.
-    fn budget(&self) -> Option<&Arc<IoBudget>> {
-        self.config.io_budget.as_ref().filter(|b| b.is_enabled())
+    /// Snapshot of what the pool holds, for the scheduling `policy`.
+    fn load(&self) -> Load {
+        Load {
+            streams: self.config.streams,
+            units: self.units.len(),
+            planning: self.planning,
+            ready_planners: self.ready_planners.len(),
+            unstarted_io: self.unstarted_io.len(),
+            in_flight: self.in_flight.len(),
+            in_flight_unknown: self.in_flight_unknown,
+            ready_morsels: self.ready_morsels.len(),
+            eligible_morsels: self.eligible_morsel_count(),
+            unsized_morsel: self.ready_morsels.iter().any(|m| m.bytes.is_none()),
+            readers: self.active_readers,
+        }
     }
 
     // ---------------------------------------------------------------
@@ -259,7 +273,7 @@ impl WorkPool {
             if self.units.is_empty() {
                 metrics.time_opening.stop();
             }
-            self.wake_all();
+            self.notify();
         }
     }
 
@@ -272,9 +286,54 @@ impl WorkPool {
     // Waking
     // ---------------------------------------------------------------
 
-    fn wake_all(&mut self) {
-        for waker in self.wakers.drain(..) {
+    /// Wake waiting streams after the pool changed.
+    ///
+    /// While work is pending, only one stream is woken: waking every idle
+    /// stream for each completed I/O or read morsel makes them all contend
+    /// for this lock, and all but one find nothing to do. The woken stream
+    /// wakes the next one if more work is ready (see [`Self::pass_on`]).
+    /// Once nothing is pending, all are woken so they can finish.
+    fn notify(&mut self) {
+        if self.has_pending_work() {
+            self.wake_one();
+        } else {
+            for (_, waker) in self.wakers.drain(..) {
+                waker.wake();
+            }
+        }
+    }
+
+    fn wake_one(&mut self) {
+        if let Some((_, waker)) = self.wakers.pop_front() {
             waker.wake();
+        }
+    }
+
+    /// Stream `waiter` no longer waits (it is dropped). If it was woken but
+    /// not polled yet, pass the wake-up on.
+    pub(super) fn unregister(&mut self, waiter: usize) {
+        self.wakers.retain(|(id, _)| *id != waiter);
+        self.notify();
+    }
+
+    /// An id identifying a stream driving this pool while it waits.
+    pub(super) fn new_waiter(&mut self) -> usize {
+        self.next_waiter += 1;
+        self.next_waiter
+    }
+
+    /// Called by stream `waiter` when it drives the pool: it is no longer
+    /// waiting (so a wake-up is not wasted on it), and if other streams are
+    /// waiting and there is ready work (possibly more than this stream
+    /// takes), one of them is woken. This passes a wake-up along the waiting
+    /// streams for as long as work is ready, without waking them all at once.
+    pub(super) fn pass_on(&mut self, waiter: usize) {
+        if self.wakers.is_empty() {
+            return;
+        }
+        self.wakers.retain(|(id, _)| *id != waiter);
+        if self.has_ready_work(false) {
+            self.wake_one();
         }
     }
 
@@ -283,14 +342,15 @@ impl WorkPool {
     /// With `may_open_more`, the stream could open more work once budget is
     /// available, so it also waits for budget released by other scans of the
     /// query.
-    pub(super) fn register(&mut self, waker: &Waker, may_open_more: bool) {
-        if !self.wakers.iter().any(|w| w.will_wake(waker)) {
-            self.wakers.push(waker.clone());
+    pub(super) fn register(&mut self, waiter: usize, waker: &Waker, may_open_more: bool) {
+        match self.wakers.iter_mut().find(|(id, _)| *id == waiter) {
+            // the stream may be polled with a different waker than before
+            Some((_, registered)) => registered.clone_from(waker),
+            None => self.wakers.push_back((waiter, waker.clone())),
         }
-        if (may_open_more || !self.unstarted_io.is_empty())
-            && let Some(budget) = self.budget()
+        if (may_open_more || !self.unstarted_io.is_empty()) && self.budget().is_enabled()
         {
-            budget.register(waker);
+            self.budget().register(waker);
         }
     }
 
@@ -325,9 +385,7 @@ impl WorkPool {
             match io.bytes {
                 Some(b) => {
                     self.in_flight_bytes -= b;
-                    if let Some(budget) = self.budget() {
-                        budget.release(b);
-                    }
+                    self.budget().release(b);
                 }
                 None => self.in_flight_unknown -= 1,
             }
@@ -348,40 +406,18 @@ impl WorkPool {
         step
     }
 
-    /// May the I/O at the front of `unstarted_io` be started now?
-    ///
-    /// With `reserve`, the bytes are reserved from the query-wide budget if
-    /// the I/O may start.
+    /// May the I/O at the front of `unstarted_io` be started now (see
+    /// `policy::admit_io`)? With `reserve`, its size is reserved if so.
     fn admit_io(&self, reserve: bool) -> bool {
         let Some((_, pending)) = self.unstarted_io.front() else {
             return false;
         };
-        let Some(budget) = self.budget() else {
-            // a single outstanding I/O, which may overlap the active reader
-            return self.in_flight.is_empty();
-        };
-        let bytes = pending.io_bytes().unwrap_or(0);
-        // Guaranteed minimum, regardless of the budget: one unit of work (an
-        // I/O in flight, a morsel ready to read, or a morsel being read) per
-        // stream driving this pool. That is what a scan does without a budget
-        // (each partition alternates between one I/O and decoding), so the
-        // budget only limits prefetch *beyond* that and a small budget is
-        // never slower than none. It also guarantees progress when other scans
-        // of the query hold the whole budget, and lets items larger than the
-        // budget run. A stream's own reader is counted in `active_readers`.
-        let below_floor =
-            self.in_flight.len() + self.active_readers + self.eligible_morsel_count()
-                < self.config.streams.max(1);
-        if below_floor {
-            if reserve {
-                budget.force_reserve(bytes);
-            }
-            return true;
-        }
+        let load = self.load();
+        let bytes = pending.info().bytes;
         if reserve {
-            budget.try_reserve(bytes)
+            policy::admit_io(&load, bytes, self.budget())
         } else {
-            budget.reserved() + bytes <= budget.limit()
+            policy::would_admit_io(&load, bytes, self.budget())
         }
     }
 
@@ -394,19 +430,18 @@ impl WorkPool {
         let mut started = false;
         while self.admit_io(true) {
             let (unit, pending) = self.unstarted_io.pop_front().expect("front");
-            let bytes = pending.io_bytes();
+            let bytes = pending.info().bytes;
             match bytes {
                 Some(b) => self.in_flight_bytes += b,
                 None => self.in_flight_unknown += 1,
             }
             let id = self.next_io;
             self.next_io += 1;
-            let future =
-                if !self.legacy() && tokio::runtime::Handle::try_current().is_ok() {
-                    IoFuture::Spawned(spawn_delivering(Arc::downgrade(this), id, pending))
-                } else {
-                    IoFuture::Inline(pending)
-                };
+            let future = if tokio::runtime::Handle::try_current().is_ok() {
+                IoFuture::Spawned(spawn_delivering(Arc::downgrade(this), id, pending))
+            } else {
+                IoFuture::Inline(pending)
+            };
             self.in_flight.push(InFlightIo {
                 id,
                 unit,
@@ -432,20 +467,10 @@ impl WorkPool {
         if self.ready_planners.is_empty() {
             return None;
         }
-        // Legacy mode: plan only when there is nothing else to do, so I/O and
-        // decoding strictly alternate.
-        if self.legacy()
-            && (stream_reading
-                || !self.ready_morsels.is_empty()
-                || !self.in_flight.is_empty()
-                || !self.unstarted_io.is_empty())
-        {
-            return None;
-        }
         if let Some(idx) = self
             .ready_planners
             .iter()
-            .position(|(_, planner)| !planner.defer_planning())
+            .position(|(_, planner)| !planner.info().defer)
         {
             return Some(idx);
         }
@@ -497,7 +522,7 @@ impl WorkPool {
     ) -> PoolStep {
         self.planning -= 1;
         // others may be waiting for planning to finish
-        self.wake_all();
+        self.notify();
         let mut plan = match result {
             Ok(Some(plan)) => plan,
             Ok(None) => {
@@ -536,12 +561,10 @@ impl WorkPool {
             morsels.len() + planners.len() + usize::from(pending.is_some()),
         );
         for morsel in morsels {
-            let bytes = morsel.buffered_bytes();
-            self.buffered_bytes += bytes;
+            let bytes = morsel.info().bytes;
+            self.buffered_bytes += bytes.unwrap_or(0);
             // already fetched: charged to the budget until read
-            if let Some(budget) = self.budget() {
-                budget.force_reserve(bytes);
-            }
+            self.budget().force_reserve(bytes.unwrap_or(0));
             self.ready_morsels.push_back(ReadyMorsel {
                 unit,
                 morsel,
@@ -563,40 +586,10 @@ impl WorkPool {
     // Opening work
     // ---------------------------------------------------------------
 
-    /// May another unit of work (file) be opened?
+    /// May another unit of work (file) be opened (see
+    /// `policy::may_open_unit`)?
     pub(super) fn may_open_unit(&self) -> bool {
-        if self.units.is_empty() && self.planning == 0 {
-            return true;
-        }
-        let streams = self.config.streams.max(1);
-        if self.legacy() {
-            return false;
-        }
-        // Guaranteed minimum, regardless of the budget (see `admit_io`): each
-        // stream may have one item of work, like each partition opens its own
-        // file without a budget.
-        let work_items = self.in_flight.len()
-            + self.active_readers
-            + self.ready_morsels.len()
-            + self.unstarted_io.len()
-            + self.ready_planners.len()
-            + self.planning;
-        if work_items < streams {
-            return true;
-        }
-        self.units.len() < MAX_OPEN_UNITS_PER_STREAM * streams
-            // budget is not already saturated
-            && self.unstarted_io.is_empty()
-            && self.ready_planners.is_empty()
-            // don't open files in bursts while their I/O size is unknown:
-            // at most one such file (being planned or loading metadata) per
-            // stream
-            && self.in_flight_unknown + self.planning < streams
-            // morsels that do not report their size (e.g. the `FileOpener`
-            // adapter) can't be charged against the budget: don't open more
-            // work while such a morsel is waiting
-            && self.ready_morsels.iter().all(|m| m.bytes > 0)
-            && self.budget().is_some_and(|b| b.has_available())
+        policy::may_open_unit(&self.load(), self.budget())
     }
 
     /// Register a newly opened file whose planner is being created outside
@@ -617,7 +610,7 @@ impl WorkPool {
         skip_errors: bool,
     ) -> PoolStep {
         self.planning -= 1;
-        self.wake_all();
+        self.notify();
         match planner {
             Ok(planner) => {
                 metrics.files_opened.add(1);
@@ -699,16 +692,14 @@ impl WorkPool {
         metrics: &mut FileStreamMetrics,
     ) {
         self.buffered_bytes -= bytes;
-        if let Some(budget) = self.budget() {
-            budget.release(bytes);
-        }
+        self.budget().release(bytes);
         self.active_readers -= 1;
         if let Some(u) = self.units.get_mut(&unit) {
             u.reading -= 1;
         }
         self.release(unit, metrics);
         // budget was freed, and the next unit may now be eligible
-        self.wake_all();
+        self.notify();
     }
 
     // ---------------------------------------------------------------
@@ -740,14 +731,13 @@ impl Drop for WorkPool {
     /// Return this scan's reservations to the query-wide budget, e.g. when
     /// the scan is dropped early (LIMIT, cancellation).
     fn drop(&mut self) {
-        if let Some(budget) = self.budget() {
-            budget.release(self.in_flight_bytes + self.buffered_bytes);
-        }
+        self.budget()
+            .release(self.in_flight_bytes + self.buffered_bytes);
     }
 }
 
 /// Spawn `pending` onto the Tokio runtime. On completion its result is
-/// delivered into the pool and all waiting streams are woken, so the I/O
+/// delivered into the pool and a waiting stream is woken, so the I/O
 /// completes without any particular stream being polled.
 fn spawn_delivering(
     pool: Weak<Mutex<WorkPool>>,
@@ -759,12 +749,12 @@ fn spawn_delivering(
         let Some(pool) = pool.upgrade() else {
             return;
         };
-        let wakers = {
+        let waker = {
             let mut pool = pool.lock();
             pool.completed.push((id, result));
-            std::mem::take(&mut pool.wakers)
+            pool.wakers.pop_front()
         };
-        for waker in wakers {
+        if let Some((_, waker)) = waker {
             waker.wake();
         }
     })

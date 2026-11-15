@@ -394,8 +394,10 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) fetched_bytes: usize,
     /// Defer the step after each fetch until its output is needed, because
     /// it evaluates a row filter with a dynamic filter that can still change
-    /// (see `MorselPlanner::defer_planning`).
+    /// (see `WorkInfo::defer`).
     pub(crate) defer_after_fetch: bool,
+    /// Whether the decoder has handed out a row group (see `defer_next`).
+    pub(crate) emitted_reader: bool,
 }
 
 /// A fully fetched row group, decoded synchronously.
@@ -623,6 +625,7 @@ impl PushDecoderStreamState {
                     }),
                     _ => None,
                 };
+                self.emitted_reader = true;
                 Ok(DecodeStep::Reader(DecodedRowGroupReader {
                     reader: Some(reader),
                     context: Arc::clone(&self.context),
@@ -633,6 +636,24 @@ impl PushDecoderStreamState {
                 self.finish();
                 Ok(DecodeStep::Finished)
             }
+        }
+    }
+
+    /// Should the next step wait until its output is needed (see
+    /// `WorkInfo::defer`)? Its decisions improve as the query progresses when
+    /// a dynamic filter can still tighten:
+    ///
+    /// * after a fetch, the next step evaluates a pushed-down row filter;
+    /// * after handing out a row group, the next step decides on the
+    ///   following row group with the dynamic row-group pruner, which should
+    ///   see the effect of the rows just handed out.
+    pub(crate) fn defer_next(&self) -> bool {
+        if self.fetched_bytes > 0 {
+            self.defer_after_fetch
+        } else {
+            self.row_group_pruner.is_some()
+                && self.emitted_reader
+                && !self.rg_plan.is_empty()
         }
     }
 

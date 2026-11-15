@@ -14,6 +14,7 @@ use futures::StreamExt as _;
 use super::work_pool::{PoolConfig, PoolStep, SharedPool, UnitId, WorkPool};
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError, StartableTime};
+use datafusion_execution::IoBudget;
 
 pub(super) use super::work_pool::ReadOrder;
 
@@ -29,9 +30,9 @@ pub(super) use super::work_pool::ReadOrder;
 ///
 /// # I/O budget
 ///
-/// Without an I/O budget (the default), the `ScanState` only ever has a
-/// single I/O outstanding and does not plan new work while a reader is
-/// active, i.e. I/O and decoding strictly alternate.
+/// Every stream may always have one unit of work (an I/O in flight, or a
+/// morsel ready or being read), as without prefetch: with a zero budget each
+/// partition alternates between fetching and decoding.
 ///
 /// With a budget, I/O is issued ahead of decoding (the next row
 /// groups of the current file, further files) as long as
@@ -95,6 +96,8 @@ pub(super) struct ScanState {
     on_error: OnError,
     /// Outstanding work (private, or shared with sibling streams).
     pool: SharedPool,
+    /// This stream's id when waiting for work of `pool`.
+    waiter: usize,
     /// The morsel this stream is reading, if any.
     reader: Option<ActiveReader>,
     /// Set once the work source has no more files.
@@ -119,7 +122,7 @@ impl ScanState {
     /// Create a new scan state.
     ///
     /// The pool is shared with sibling streams when they share a work source,
-    /// the query has an I/O budget and order is not [`ReadOrder::Required`];
+    /// there is no limit and order is not [`ReadOrder::Required`];
     /// otherwise it is private.
     pub(super) fn new(
         work_source: WorkSource,
@@ -131,12 +134,13 @@ impl ScanState {
     ) -> Self {
         if remain.is_some() {
             // avoid reading ahead data that will not be needed
-            config.io_budget = None;
+            config.io_budget = IoBudget::new(0);
         }
-        let prefetch = config.io_budget.as_ref().is_some_and(|b| b.is_enabled());
+        // Siblings share their outstanding work unless the order matters (or
+        // a limit applies, whose file accounting is per stream).
         let shared = work_source
             .shared()
-            .filter(|_| prefetch && config.read_order != ReadOrder::Required);
+            .filter(|_| remain.is_none() && config.read_order != ReadOrder::Required);
         let streams = if shared.is_some() {
             config.streams.max(1)
         } else {
@@ -154,12 +158,14 @@ impl ScanState {
             Some(shared) => shared.pool(config),
             None => WorkPool::new_shared(config),
         };
+        let waiter = pool.lock().new_waiter();
         Self {
             work_source,
             remain,
             morselizer,
             on_error,
             pool,
+            waiter,
             reader: None,
             source_done: false,
             metrics,
@@ -205,6 +211,7 @@ impl ScanState {
         // 1.-3.: I/O and planning
         {
             let mut guard = pool.lock();
+            guard.pass_on(self.waiter);
             if let Some(ret) =
                 Self::step_result(guard.collect_io(cx, &mut self.metrics, skip_errors))
             {
@@ -243,15 +250,18 @@ impl ScanState {
                 Ok(stream) => {
                     self.reader = Some(ActiveReader {
                         unit: morsel.unit,
-                        bytes: morsel.bytes,
+                        bytes: morsel.bytes.unwrap_or(0),
                         stream,
                     });
                     ScanAndReturn::Continue
                 }
                 Err(err) => {
                     self.metrics.file_open_errors.add(1);
-                    pool.lock()
-                        .finish_read(morsel.unit, morsel.bytes, &mut self.metrics);
+                    pool.lock().finish_read(
+                        morsel.unit,
+                        morsel.bytes.unwrap_or(0),
+                        &mut self.metrics,
+                    );
                     self.error(err)
                 }
             };
@@ -290,7 +300,7 @@ impl ScanState {
         if guard.has_ready_work(false) || (!self.source_done && guard.may_open_unit()) {
             return ScanAndReturn::Continue;
         }
-        guard.register(cx.waker(), !self.source_done);
+        guard.register(self.waiter, cx.waker(), !self.source_done);
         ScanAndReturn::Return(Poll::Pending)
     }
 
@@ -375,10 +385,13 @@ impl Drop for ScanState {
     /// Release a morsel this stream was reading when it is dropped (finished,
     /// failed or cancelled), so that with a shared pool its bytes return to
     /// the budget and its unit of work can finish while siblings continue.
+    /// A stream dropped while waiting stops waiting, so that wake-ups go to
+    /// siblings instead.
     fn drop(&mut self) {
         if self.reader.is_some() {
             self.finish_reader();
         }
+        self.pool.lock().unregister(self.waiter);
     }
 }
 
