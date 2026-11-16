@@ -29,6 +29,7 @@ use crate::metrics::{
     SpillMetrics,
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
+use crate::provisional_properties::UnmetInputRequirements;
 use crate::sorts::IncrementalSortIterator;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
@@ -1351,8 +1352,13 @@ impl SortExec {
     /// input partitions producing a single, sorted partition.
     pub fn with_preserve_partitioning(mut self, preserve_partitioning: bool) -> Self {
         self.preserve_partitioning = preserve_partitioning;
-        Arc::make_mut(&mut self.cache).partitioning =
+        let cache = Arc::make_mut(&mut self.cache);
+        cache.partitioning =
             Self::output_partitioning_helper(&self.input, self.preserve_partitioning);
+        cache.set_unmet_input_requirements(Self::unmet_input_requirements(
+            &self.input,
+            self.preserve_partitioning,
+        ));
         if self.fetch.is_some() {
             self.rebuild_filter_for_current_partitioning();
         }
@@ -1522,6 +1528,30 @@ impl SortExec {
         }
     }
 
+    /// SPIKE: the input requirement this sort is still waiting for, if any.
+    ///
+    /// Without `preserve_partitioning` the sort requires a single input
+    /// partition. Until the optimizer provides one, the equivalence
+    /// properties computed from the multi-partition input (e.g. per-partition
+    /// constants) may not hold for the merged output.
+    fn unmet_input_requirements(
+        input: &Arc<dyn ExecutionPlan>,
+        preserve_partitioning: bool,
+    ) -> Option<UnmetInputRequirements> {
+        let partition_count = input.output_partitioning().partition_count();
+        if !preserve_partitioning && partition_count > 1 {
+            return Some(UnmetInputRequirements::new(
+                "SortExec",
+                format!(
+                    "preserve_partitioning=false requires a single input partition, \
+                     input has {partition_count}"
+                ),
+            ));
+        }
+        // Provisional input properties make ours provisional too.
+        input.properties().unmet_input_requirements().cloned()
+    }
+
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
     /// It also returns the common sort prefix between the input and the sort expressions.
     fn compute_properties(
@@ -1573,7 +1603,11 @@ impl SortExec {
                 output_partitioning,
                 emission_type,
                 boundedness,
-            ),
+            )
+            .with_unmet_input_requirements(Self::unmet_input_requirements(
+                input,
+                preserve_partitioning,
+            )),
             sort_prefix,
         ))
     }
@@ -2524,6 +2558,43 @@ mod tests {
     use futures::{FutureExt, Stream, TryStreamExt};
     use insta::assert_snapshot;
     use tokio::sync::Notify;
+
+    /// SPIKE: a merging `SortExec` over several partitions reports provisional
+    /// properties until its single-partition requirement is met.
+    #[test]
+    fn sort_properties_are_provisional_until_input_requirements_are_met() -> Result<()> {
+        use crate::provisional_properties::is_unmet_input_requirements;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+        let two_partitions =
+            TestMemoryExec::try_new_exec(&[vec![], vec![]], Arc::clone(&schema), None)?;
+
+        // Merging two partitions: provisional, and the error is recognizable.
+        let merging = SortExec::new(ordering.clone(), Arc::clone(&two_partitions) as _);
+        let err = merging.properties().try_output_ordering().unwrap_err();
+        assert!(is_unmet_input_requirements(&err), "{err}");
+        assert!(merging.properties().try_equivalence_properties().is_err());
+
+        // Provisional-ness propagates through a parent `SortExec`.
+        let parent = SortExec::new(ordering.clone(), Arc::new(merging.clone()))
+            .with_preserve_partitioning(true);
+        assert!(parent.properties().unmet_input_requirements().is_some());
+
+        // Preserving partitioning has no single-partition requirement.
+        let preserving = merging.with_preserve_partitioning(true);
+        assert_eq!(
+            preserving.properties().try_output_ordering()?,
+            Some(&ordering)
+        );
+
+        // Neither does a merging sort whose input has one partition.
+        let coalesced = Arc::new(CoalescePartitionsExec::new(two_partitions));
+        let merging = SortExec::new(ordering.clone(), coalesced);
+        assert_eq!(merging.properties().try_output_ordering()?, Some(&ordering));
+        Ok(())
+    }
 
     /// Runs sharing a buffer address with different capacities, as FFI-imported
     /// slices do. <https://github.com/apache/datafusion/issues/27069>

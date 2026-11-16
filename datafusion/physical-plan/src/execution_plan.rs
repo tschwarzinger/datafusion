@@ -10,6 +10,7 @@ use crate::filter_pushdown::{
 };
 pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
+use crate::provisional_properties::{UnmetInputRequirements, on_provisional_read};
 use crate::sort_pushdown::SortOrderPushdownResult;
 pub use crate::stream::EmptyRecordBatchStream;
 
@@ -1264,6 +1265,7 @@ impl ExecutionPlanProperties for Arc<dyn ExecutionPlan> {
         self.properties().output_partitioning()
     }
 
+    #[track_caller]
     fn output_ordering(&self) -> Option<&LexOrdering> {
         self.properties().output_ordering()
     }
@@ -1276,6 +1278,7 @@ impl ExecutionPlanProperties for Arc<dyn ExecutionPlan> {
         self.properties().emission_type
     }
 
+    #[track_caller]
     fn equivalence_properties(&self) -> &EquivalenceProperties {
         self.properties().equivalence_properties()
     }
@@ -1286,6 +1289,7 @@ impl ExecutionPlanProperties for &dyn ExecutionPlan {
         self.properties().output_partitioning()
     }
 
+    #[track_caller]
     fn output_ordering(&self) -> Option<&LexOrdering> {
         self.properties().output_ordering()
     }
@@ -1298,6 +1302,7 @@ impl ExecutionPlanProperties for &dyn ExecutionPlan {
         self.properties().emission_type
     }
 
+    #[track_caller]
     fn equivalence_properties(&self) -> &EquivalenceProperties {
         self.properties().equivalence_properties()
     }
@@ -1513,6 +1518,10 @@ pub struct PlanProperties {
     pub scheduling_type: SchedulingType,
     /// See [ExecutionPlanProperties::output_ordering]
     output_ordering: Option<LexOrdering>,
+    /// SPIKE: set when this node's input requirements are not met yet, so
+    /// that its ordering / equivalence properties are only provisional.
+    /// See [`crate::provisional_properties`].
+    unmet_input_requirements: Option<Arc<UnmetInputRequirements>>,
 }
 
 impl PlanProperties {
@@ -1533,6 +1542,50 @@ impl PlanProperties {
             evaluation_type: EvaluationType::Lazy,
             scheduling_type: SchedulingType::NonCooperative,
             output_ordering,
+            unmet_input_requirements: None,
+        }
+    }
+
+    /// SPIKE: mark (or unmark, with `None`) these properties as provisional
+    /// because the node's input requirements are not met yet.
+    pub fn with_unmet_input_requirements(
+        mut self,
+        unmet: Option<UnmetInputRequirements>,
+    ) -> Self {
+        self.set_unmet_input_requirements(unmet);
+        self
+    }
+
+    /// SPIKE: in-place variant of [`Self::with_unmet_input_requirements`].
+    pub fn set_unmet_input_requirements(
+        &mut self,
+        unmet: Option<UnmetInputRequirements>,
+    ) {
+        self.unmet_input_requirements = unmet.map(Arc::new);
+    }
+
+    /// SPIKE: the unmet input requirement that makes these properties
+    /// provisional, if any.
+    pub fn unmet_input_requirements(&self) -> Option<&UnmetInputRequirements> {
+        self.unmet_input_requirements.as_deref()
+    }
+
+    /// SPIKE: fallible variant of [`Self::equivalence_properties`] that
+    /// returns an [`UnmetInputRequirements`] error for provisional
+    /// properties.
+    pub fn try_equivalence_properties(&self) -> Result<&EquivalenceProperties> {
+        match &self.unmet_input_requirements {
+            Some(unmet) => Err(UnmetInputRequirements::clone(unmet).into()),
+            None => Ok(&self.eq_properties),
+        }
+    }
+
+    /// SPIKE: fallible variant of [`Self::output_ordering`] that returns an
+    /// [`UnmetInputRequirements`] error for provisional properties.
+    pub fn try_output_ordering(&self) -> Result<Option<&LexOrdering>> {
+        match &self.unmet_input_requirements {
+            Some(unmet) => Err(UnmetInputRequirements::clone(unmet).into()),
+            None => Ok(self.output_ordering.as_ref()),
         }
     }
 
@@ -1595,7 +1648,11 @@ impl PlanProperties {
         self
     }
 
+    #[track_caller]
     pub fn equivalence_properties(&self) -> &EquivalenceProperties {
+        if let Some(unmet) = &self.unmet_input_requirements {
+            on_provisional_read("equivalence_properties", unmet);
+        }
         &self.eq_properties
     }
 
@@ -1603,7 +1660,11 @@ impl PlanProperties {
         &self.partitioning
     }
 
+    #[track_caller]
     pub fn output_ordering(&self) -> Option<&LexOrdering> {
+        if let Some(unmet) = &self.unmet_input_requirements {
+            on_provisional_read("output_ordering", unmet);
+        }
         self.output_ordering.as_ref()
     }
 

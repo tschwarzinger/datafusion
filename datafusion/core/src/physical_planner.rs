@@ -103,6 +103,7 @@ use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::joins::PiecewiseMergeJoinExec;
 use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::provisional_properties::is_unmet_input_requirements;
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
@@ -1042,7 +1043,21 @@ impl DefaultPhysicalPlanner {
                     file_output_mode,
                 };
 
-                let ordering = input_exec.properties().output_ordering().cloned();
+                // SPIKE: the input's properties may be provisional here, since
+                // `EnforceDistribution` / `EnforceSorting` have not run yet.
+                // The typed error lets us tell that apart from real errors.
+                let ordering = match input_exec.properties().try_output_ordering() {
+                    Ok(ordering) => ordering.cloned(),
+                    Err(e) if is_unmet_input_requirements(&e) => {
+                        match input_exec.downcast_ref::<SortExec>() {
+                            // Once its requirement is met, a sort's output is
+                            // ordered by its full sort expression.
+                            Some(sort) => Some(sort.expr().clone()),
+                            None => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 sink_format
                     .create_writer_physical_plan(

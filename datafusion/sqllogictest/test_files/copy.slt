@@ -823,3 +823,73 @@ physical_plan
 
 statement count 0
 drop table t;
+
+# COPY (... UNION ALL ... ORDER BY) must write rows in ORDER BY order, even
+# though each UNION ALL arm has a different constant `id`. The planner reads
+# the input ordering before `EnforceDistribution` runs, when the merging
+# `SortExec` only has provisional properties (`id` is a per-partition constant).
+query I
+COPY (VALUES (1), (2), (3)) TO 'test_files/scratch/copy/union_const_order/src.csv'
+STORED AS CSV OPTIONS ('format.has_header' 'true');
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE union_const_src(ts INT) STORED AS CSV WITH ORDER (ts ASC)
+LOCATION 'test_files/scratch/copy/union_const_order/src.csv'
+OPTIONS ('format.has_header' 'true');
+
+query TT
+EXPLAIN COPY (
+  SELECT 'b' AS id, ts FROM union_const_src
+  UNION ALL
+  SELECT 'a' AS id, ts FROM union_const_src
+  ORDER BY id, ts
+) TO 'test_files/scratch/copy/union_const_order/out.csv' STORED AS CSV;
+----
+logical_plan
+01)CopyTo: format=csv output_url=test_files/scratch/copy/union_const_order/out.csv options: ()
+02)--Sort: id ASC NULLS LAST, ts ASC NULLS LAST
+03)----Union
+04)------Projection: Utf8("b") AS id, union_const_src.ts
+05)--------TableScan: union_const_src projection=[ts]
+06)------Projection: Utf8("a") AS id, union_const_src.ts
+07)--------TableScan: union_const_src projection=[ts]
+physical_plan
+01)DataSinkExec: sink=CsvSink(file_groups=[])
+02)--SortPreservingMergeExec: [id@0 ASC NULLS LAST, ts@1 ASC NULLS LAST]
+03)----UnionExec
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/copy/union_const_order/src.csv]]}, projection=[b as id, ts], output_ordering=[ts@1 ASC NULLS LAST], file_type=csv, has_header=true
+05)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/copy/union_const_order/src.csv]]}, projection=[a as id, ts], output_ordering=[ts@1 ASC NULLS LAST], file_type=csv, has_header=true
+
+query I
+COPY (
+  SELECT 'b' AS id, ts FROM union_const_src
+  UNION ALL
+  SELECT 'a' AS id, ts FROM union_const_src
+  ORDER BY id, ts
+) TO 'test_files/scratch/copy/union_const_order/out.csv' STORED AS CSV;
+----
+6
+
+statement ok
+CREATE EXTERNAL TABLE union_const_out(id VARCHAR, ts INT) STORED AS CSV
+LOCATION 'test_files/scratch/copy/union_const_order/out.csv'
+OPTIONS ('format.has_header' 'true');
+
+# No ORDER BY: the file must already be in order.
+query TI
+SELECT * FROM union_const_out;
+----
+a 1
+a 2
+a 3
+b 1
+b 2
+b 3
+
+statement ok
+DROP TABLE union_const_src;
+
+statement ok
+DROP TABLE union_const_out;
