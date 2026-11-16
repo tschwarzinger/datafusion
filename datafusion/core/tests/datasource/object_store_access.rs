@@ -1115,10 +1115,10 @@ impl Test {
     fn new() -> Self {
         let object_store = Arc::new(RequestCountingObjectStore::new());
         // These tests document the exact object store requests of a query.
-        // Disable I/O prefetch: with it, requests are issued concurrently and
-        // recorded in a non-deterministic order.
+        // Disable the I/O budget (prefetch): with it, requests are issued
+        // concurrently and recorded in a non-deterministic order.
         let mut config = SessionConfig::new();
-        config.options_mut().execution.scan_io_budget_bytes = 0;
+        config.options_mut().execution.enable_scan_io_budget = false;
         let session_context = SessionContext::new_with_config(config);
         session_context
             .runtime_env()

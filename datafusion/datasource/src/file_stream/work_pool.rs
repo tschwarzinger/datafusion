@@ -18,7 +18,7 @@ use crate::morsel::{Morsel, MorselPlan, MorselPlanner, PendingMorselPlanner};
 use datafusion_execution::IoBudget;
 
 use super::FileStreamMetrics;
-use super::policy::{Policy, PoolLoad};
+use super::policy::{Admitted, Policy, PoolLoad};
 
 /// A [`WorkPool`] that may be shared by sibling streams.
 pub(super) type SharedPool = Arc<Mutex<WorkPool>>;
@@ -43,10 +43,10 @@ pub(super) enum ReadOrder {
 /// Configuration of a [`WorkPool`].
 #[derive(Debug, Clone)]
 pub(super) struct PoolConfig {
-    /// Query-wide budget for prefetching: in-flight I/O plus fetched but not
-    /// yet read morsels beyond the guaranteed minimum (see `policy`). A zero
-    /// budget means no prefetch.
-    pub(super) io_budget: Arc<IoBudget>,
+    /// Query-wide budget for in-flight I/O plus fetched but not yet read
+    /// morsels (see `policy`). `None`: no prefetch, one unit of work per
+    /// stream.
+    pub(super) io_budget: Option<Arc<IoBudget>>,
     pub(super) read_order: ReadOrder,
     /// Number of streams driving this pool.
     pub(super) streams: usize,
@@ -146,8 +146,8 @@ struct InFlightIo {
 
 enum IoFuture {
     /// Polled inline by whichever stream drives the pool (no Tokio runtime
-    /// available).
-    Inline(PendingMorselPlanner),
+    /// available). Holds its admission while in flight.
+    Inline(PendingMorselPlanner, #[expect(dead_code)] Admitted),
     /// Spawned onto the Tokio runtime; delivers its result into `completed`.
     /// Kept so the task is aborted if the pool is dropped.
     Spawned(#[expect(dead_code)] SpawnedTask<()>),
@@ -189,11 +189,17 @@ impl WorkPool {
         Arc::new(Mutex::new(Self::new(config)))
     }
 
-    fn budget(&self) -> &IoBudget {
-        &self.config.io_budget
+    fn budget(&self) -> Option<&Arc<IoBudget>> {
+        self.config.io_budget.as_ref()
     }
 
-    /// Snapshot of what the pool holds, for the scheduling `policy`.
+    fn release_budget(&self, bytes: usize) {
+        if let Some(budget) = self.budget() {
+            budget.release(bytes);
+        }
+    }
+
+    /// The scheduling policy, with this query's budget.
     fn policy(&self) -> Policy<'_> {
         Policy::new(self.budget())
     }
@@ -336,9 +342,10 @@ impl WorkPool {
             Some((_, registered)) => registered.clone_from(waker),
             None => self.wakers.push_back((waiter, waker.clone())),
         }
-        if (may_open_more || !self.unstarted_io.is_empty()) && self.budget().is_enabled()
+        if (may_open_more || !self.unstarted_io.is_empty())
+            && let Some(budget) = self.budget()
         {
-            self.budget().register(waker);
+            budget.register(waker);
         }
     }
 
@@ -357,7 +364,7 @@ impl WorkPool {
         let mut results = std::mem::take(&mut self.completed);
         let mut i = 0;
         while i < self.in_flight.len() {
-            if let IoFuture::Inline(future) = &mut self.in_flight[i].future
+            if let IoFuture::Inline(future, _) = &mut self.in_flight[i].future
                 && let Poll::Ready(result) = future.poll_unpin(cx)
             {
                 results.push((self.in_flight[i].id, result));
@@ -373,7 +380,7 @@ impl WorkPool {
             match io.bytes {
                 Some(b) => {
                     self.in_flight_bytes -= b;
-                    self.budget().release(b);
+                    self.release_budget(b);
                 }
                 None => self.in_flight_unknown -= 1,
             }
@@ -394,29 +401,45 @@ impl WorkPool {
         step
     }
 
-    /// May the I/O at the front of `unstarted_io` be started now (see
-    /// [`Policy::admit_io`])? With `reserve`, its size is reserved if so.
-    fn admit_io(&self, reserve: bool) -> bool {
-        let Some((_, pending)) = self.unstarted_io.front() else {
-            return false;
-        };
-        let bytes = pending.info().bytes;
-        if reserve {
-            self.policy().admit_io(self, bytes)
-        } else {
-            self.policy().would_admit_io(self, bytes)
+    /// Index of the I/O in `unstarted_io` to start next: in the order the
+    /// I/O was created, or for ordered reads in planned order, so the unit
+    /// read next is not fetched after later ones (e.g. when the budget only
+    /// lets I/O run one at a time).
+    fn next_io_index(&self) -> Option<usize> {
+        match self.config.read_order {
+            ReadOrder::Any => (!self.unstarted_io.is_empty()).then_some(0),
+            ReadOrder::Preferred | ReadOrder::Required => self
+                .unstarted_io
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (unit, _))| *unit)
+                .map(|(idx, _)| idx),
         }
     }
 
-    fn can_start_io(&self) -> bool {
-        self.admit_io(false)
+    /// Admit the I/O to start next (see [`Self::next_io_index`]) now (see
+    /// [`Policy::admit_io`])? Returns its index and admission.
+    fn admit_io(&self) -> Option<(usize, Admitted)> {
+        let idx = self.next_io_index()?;
+        let (_, pending) = &self.unstarted_io[idx];
+        let admitted = self.policy().admit_io(self, pending.info().bytes)?;
+        Some((idx, admitted))
     }
 
-    /// Start I/O as allowed by the budget. Returns true if any I/O was started.
+    /// Would [`Self::admit_io`] admit an I/O now?
+    fn can_start_io(&self) -> bool {
+        self.next_io_index().is_some_and(|idx| {
+            let (_, pending) = &self.unstarted_io[idx];
+            self.policy().would_admit_io(self, pending.info().bytes)
+        })
+    }
+
+    /// Start I/O as allowed by the policy. Returns true if any I/O was
+    /// started.
     pub(super) fn start_io(&mut self, this: &SharedPool) -> bool {
         let mut started = false;
-        while self.admit_io(true) {
-            let (unit, pending) = self.unstarted_io.pop_front().expect("front");
+        while let Some((idx, admitted)) = self.admit_io() {
+            let (unit, pending) = self.unstarted_io.remove(idx).expect("index valid");
             let bytes = pending.info().bytes;
             match bytes {
                 Some(b) => self.in_flight_bytes += b,
@@ -425,9 +448,14 @@ impl WorkPool {
             let id = self.next_io;
             self.next_io += 1;
             let future = if tokio::runtime::Handle::try_current().is_ok() {
-                IoFuture::Spawned(spawn_delivering(Arc::downgrade(this), id, pending))
+                IoFuture::Spawned(spawn_delivering(
+                    Arc::downgrade(this),
+                    id,
+                    pending,
+                    admitted,
+                ))
             } else {
-                IoFuture::Inline(pending)
+                IoFuture::Inline(pending, admitted)
             };
             self.in_flight.push(InFlightIo {
                 id,
@@ -454,11 +482,21 @@ impl WorkPool {
         if self.ready_planners.is_empty() {
             return None;
         }
-        if let Some(idx) = self
+        // planners that need not be deferred: in the order they became ready,
+        // or for ordered reads in planned order (so the unit read next is
+        // planned, and its I/O issued, first)
+        let mut undeferred = self
             .ready_planners
             .iter()
-            .position(|(_, planner)| !planner.info().defer)
-        {
+            .enumerate()
+            .filter(|(_, (_, planner))| !planner.info().defer);
+        let next = match self.config.read_order {
+            ReadOrder::Any => undeferred.next(),
+            ReadOrder::Preferred | ReadOrder::Required => {
+                undeferred.min_by_key(|(_, (unit, _))| *unit)
+            }
+        };
+        if let Some((idx, _)) = next {
             return Some(idx);
         }
         // Only deferred planners are ready (see
@@ -551,7 +589,9 @@ impl WorkPool {
             let bytes = morsel.info().bytes;
             self.buffered_bytes += bytes.unwrap_or(0);
             // already fetched: charged to the budget until read
-            self.budget().force_reserve(bytes.unwrap_or(0));
+            if let Some(budget) = self.budget() {
+                budget.force_reserve(bytes.unwrap_or(0));
+            }
             self.ready_morsels.push_back(ReadyMorsel {
                 unit,
                 morsel,
@@ -679,7 +719,7 @@ impl WorkPool {
         metrics: &mut FileStreamMetrics,
     ) {
         self.buffered_bytes -= bytes;
-        self.budget().release(bytes);
+        self.release_budget(bytes);
         self.active_readers -= 1;
         if let Some(u) = self.units.get_mut(&unit) {
             u.reading -= 1;
@@ -755,8 +795,7 @@ impl Drop for WorkPool {
     /// Return this scan's reservations to the query-wide budget, e.g. when
     /// the scan is dropped early (LIMIT, cancellation).
     fn drop(&mut self) {
-        self.budget()
-            .release(self.in_flight_bytes + self.buffered_bytes);
+        self.release_budget(self.in_flight_bytes + self.buffered_bytes);
     }
 }
 
@@ -767,9 +806,12 @@ fn spawn_delivering(
     pool: Weak<Mutex<WorkPool>>,
     id: u64,
     pending: PendingMorselPlanner,
+    admitted: Admitted,
 ) -> SpawnedTask<()> {
     SpawnedTask::spawn(async move {
         let result = pending.await;
+        // the I/O is no longer in flight (its bytes stay reserved)
+        drop(admitted);
         let Some(pool) = pool.upgrade() else {
             return;
         };

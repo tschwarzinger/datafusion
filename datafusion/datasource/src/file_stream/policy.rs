@@ -7,13 +7,16 @@
 //!
 //! The pool does the book keeping (which items exist, their order) and
 //! answers the questions of [`PoolLoad`]; [`Policy`] decides from those
-//! answers when another I/O may start and when another file may be opened.
+//! answers, and the query-wide [`IoBudget`] if any, when another I/O may start
+//! and when another file may be opened.
 //! Keeping the rules here keeps them in one place and testable without a
 //! pool.
 //!
 //! [`WorkPool`]: super::work_pool::WorkPool
 
-use datafusion_execution::IoBudget;
+use std::sync::Arc;
+
+use datafusion_execution::{IoBudget, IoTicket};
 
 /// Maximum number of units of work open per stream sharing a pool,
 /// regardless of the I/O budget.
@@ -46,47 +49,68 @@ pub trait PoolLoad {
     fn readers(&self) -> usize;
 }
 
-/// Decides how much work a pool starts, within a query-wide [`IoBudget`].
+/// Decides how much work a pool starts.
 ///
-/// Every scan gets a guaranteed minimum of one unit of work per stream (an
-/// I/O in flight, a morsel ready to read, or a morsel being read): what each
-/// partition holds without prefetch, alternating between fetching and
-/// decoding. Within the minimum, work starts regardless of the budget: a
-/// budget, however small, is never slower than none, a scan makes progress
-/// when other scans of the query hold the whole budget, and an I/O larger
-/// than the budget still runs. Beyond the minimum, work starts if it fits the
-/// budget (prefetch).
+/// * Without a budget, each stream has one unit of work: an I/O in flight, a
+///   morsel ready to read, or a morsel being read. Each partition alternates
+///   between fetching and decoding, as a scan without prefetch does.
+/// * With a query-wide [`IoBudget`], I/O starts while it fits the budget
+///   (prefetch). When it does not fit, an I/O only starts if no other I/O of
+///   the query is in flight and this pool has no fetched morsel that could be
+///   read now (see [`IoBudget::try_start_sole_io`]): the query keeps making
+///   progress (e.g. when another scan, not being polled, holds the budget),
+///   I/O larger than the budget still runs, and fetched data beyond the
+///   budget stays bounded. Morsels that may not be read yet (an ordered
+///   read waiting for an earlier unit) don't block it: the earlier unit's
+///   I/O may be the one needed.
 #[derive(Debug, Clone, Copy)]
 pub struct Policy<'a> {
-    budget: &'a IoBudget,
+    budget: Option<&'a Arc<IoBudget>>,
 }
 
 impl<'a> Policy<'a> {
-    pub fn new(budget: &'a IoBudget) -> Self {
+    pub fn new(budget: Option<&'a Arc<IoBudget>>) -> Self {
         Self { budget }
     }
 
-    /// May an I/O of `bytes` (if known) start now? If so, its known size is
-    /// reserved from the budget.
-    pub fn admit_io(&self, load: &impl PoolLoad, bytes: Option<usize>) -> bool {
+    /// Start an I/O of `bytes` (if known) now? Returns the ticket marking it
+    /// in flight if so (reserving its known size from the budget, if any).
+    pub fn admit_io(
+        &self,
+        load: &impl PoolLoad,
+        bytes: Option<usize>,
+    ) -> Option<Admitted> {
         let bytes = bytes.unwrap_or(0);
-        if below_minimum(load) {
-            self.budget.force_reserve(bytes);
-            return true;
+        match self.budget {
+            None => below_minimum(load).then_some(Admitted(None)),
+            Some(budget) => budget
+                .try_start_io(bytes)
+                .or_else(|| {
+                    (load.eligible_morsels() == 0)
+                        .then(|| budget.try_start_sole_io(bytes))
+                        .flatten()
+                })
+                .map(|ticket| Admitted(Some(ticket))),
         }
-        self.budget.try_reserve(bytes)
     }
 
-    /// Like [`Self::admit_io`], without reserving.
+    /// Would [`Self::admit_io`] start the I/O now?
     pub fn would_admit_io(&self, load: &impl PoolLoad, bytes: Option<usize>) -> bool {
-        below_minimum(load) || self.budget.fits(bytes.unwrap_or(0))
+        let bytes = bytes.unwrap_or(0);
+        match self.budget {
+            None => below_minimum(load),
+            Some(budget) => {
+                budget.reserved() + bytes <= budget.limit()
+                    || (load.eligible_morsels() == 0 && budget.in_flight() == 0)
+            }
+        }
     }
 
     /// May another unit of work (file) be opened?
     pub fn may_open_unit(&self, load: &impl PoolLoad) -> bool {
         let streams = load.streams().max(1);
-        // Nothing open, or the guaranteed minimum (one item of work per
-        // stream, like each partition opening its own file without a budget).
+        // Nothing open, or fewer items of work than streams (like each
+        // partition opening its own file).
         let work_items = load.planning()
             + load.ready_planners()
             + load.unstarted_io()
@@ -96,7 +120,10 @@ impl<'a> Policy<'a> {
         if work_items < streams {
             return true;
         }
-        // Prefetch beyond the minimum, within the budget.
+        let Some(budget) = self.budget else {
+            return false;
+        };
+        // Prefetch beyond that, within the budget.
         load.units() < MAX_OPEN_UNITS_PER_STREAM * streams
             // the budget is not already saturated by work waiting to start
             && load.unstarted_io() == 0
@@ -109,11 +136,15 @@ impl<'a> Policy<'a> {
             // adapter) can't be charged against the budget: don't open more
             // work while such a morsel is waiting
             && !load.has_unsized_morsel()
-            && self.budget.has_available()
+            && budget.has_available()
     }
 }
 
-/// Is the pool below the guaranteed minimum (see [`Policy`])?
+/// An admitted I/O: holds its [`IoTicket`] (if budgeted) while in flight.
+#[derive(Debug)]
+pub struct Admitted(#[expect(dead_code)] Option<IoTicket>);
+
+/// Without a budget: does the pool have fewer units of work than streams?
 fn below_minimum(load: &impl PoolLoad) -> bool {
     load.in_flight() + load.eligible_morsels() + load.readers() < load.streams().max(1)
 }
@@ -129,6 +160,7 @@ mod tests {
         in_flight: usize,
         in_flight_unknown: usize,
         readers: usize,
+        eligible_morsels: usize,
         unsized_morsel: bool,
     }
 
@@ -155,10 +187,10 @@ mod tests {
             self.in_flight_unknown
         }
         fn ready_morsels(&self) -> usize {
-            0
+            self.eligible_morsels
         }
         fn eligible_morsels(&self) -> usize {
-            0
+            self.eligible_morsels
         }
         fn has_unsized_morsel(&self) -> bool {
             self.unsized_morsel
@@ -176,56 +208,75 @@ mod tests {
     }
 
     #[test]
-    fn minimum_is_one_unit_of_work_per_stream() {
-        // no budget at all: one I/O per stream, then nothing
-        let budget = IoBudget::new(0);
-        let policy = Policy::new(&budget);
+    fn without_budget_one_unit_of_work_per_stream() {
+        let policy = Policy::new(None);
         let mut l = load(2);
-        assert!(policy.admit_io(&l, Some(100)));
+        assert!(policy.admit_io(&l, Some(100)).is_some());
         l.in_flight = 1;
-        assert!(policy.admit_io(&l, Some(100)));
+        assert!(policy.admit_io(&l, Some(100)).is_some());
         l.in_flight = 2;
-        assert!(!policy.admit_io(&l, Some(100)));
+        assert!(policy.admit_io(&l, Some(100)).is_none());
         // a stream reading counts as its unit of work
         l.in_flight = 1;
         l.readers = 1;
-        assert!(!policy.admit_io(&l, Some(100)));
-        assert_eq!(budget.reserved(), 200, "the minimum is charged too");
+        assert!(policy.admit_io(&l, Some(100)).is_none());
+        assert!(!policy.would_admit_io(&l, Some(100)));
     }
 
     #[test]
-    fn prefetch_beyond_the_minimum_within_the_budget() {
+    fn within_the_budget_then_one_io_at_a_time() {
         let budget = IoBudget::new(150);
-        let policy = Policy::new(&budget);
-        let mut l = load(1);
-        l.readers = 1;
-        assert!(policy.admit_io(&l, Some(100)));
-        l.in_flight = 1;
-        assert!(!policy.admit_io(&l, Some(100)), "200 > 150");
-        assert!(policy.admit_io(&l, Some(50)));
+        let policy = Policy::new(Some(&budget));
+        let l = load(4);
+        let a = policy.admit_io(&l, Some(100)).expect("fits");
+        assert!(policy.admit_io(&l, Some(100)).is_none(), "200 > 150");
+        let b = policy.admit_io(&l, Some(50)).expect("fits");
         assert!(!policy.would_admit_io(&l, Some(1)));
+        drop((a, b));
+        // the data is fetched (still reserved), no I/O in flight: one more
+        assert!(policy.would_admit_io(&l, Some(100)));
+        let c = policy.admit_io(&l, Some(100)).expect("sole I/O");
+        assert!(policy.admit_io(&l, Some(1)).is_none());
+        drop(c);
+        // not while fetched data of this pool can be read
+        let mut waiting = load(4);
+        waiting.eligible_morsels = 1;
+        assert!(!policy.would_admit_io(&waiting, Some(1)));
+        assert!(policy.admit_io(&waiting, Some(1)).is_none());
+        assert!(policy.admit_io(&l, Some(1)).is_some());
+    }
+
+    #[test]
+    fn zero_budget_is_sequential() {
+        let budget = IoBudget::new(0);
+        let policy = Policy::new(Some(&budget));
+        let l = load(4);
+        let a = policy.admit_io(&l, Some(100)).expect("first I/O");
+        assert!(policy.admit_io(&l, Some(100)).is_none());
+        drop(a);
+        assert!(policy.admit_io(&l, Some(100)).is_some());
     }
 
     #[test]
     fn opening_files() {
         let budget = IoBudget::new(1000);
-        let no_budget = IoBudget::new(0);
         let mut l = load(2);
-        assert!(Policy::new(&budget).may_open_unit(&l));
+        assert!(Policy::new(Some(&budget)).may_open_unit(&l));
         // one file per stream regardless of the budget
         l.units = 1;
         l.in_flight = 1;
-        assert!(Policy::new(&no_budget).may_open_unit(&l));
+        assert!(Policy::new(None).may_open_unit(&l));
         // beyond: only with budget, and not while metadata of unknown size
         // is read for each stream
         l.units = 2;
         l.in_flight = 2;
-        assert!(!Policy::new(&no_budget).may_open_unit(&l));
-        assert!(Policy::new(&budget).may_open_unit(&l));
+        assert!(!Policy::new(None).may_open_unit(&l));
+        assert!(!Policy::new(Some(&IoBudget::new(0))).may_open_unit(&l));
+        assert!(Policy::new(Some(&budget)).may_open_unit(&l));
         l.in_flight_unknown = 2;
-        assert!(!Policy::new(&budget).may_open_unit(&l));
+        assert!(!Policy::new(Some(&budget)).may_open_unit(&l));
         l.in_flight_unknown = 0;
         l.unsized_morsel = true;
-        assert!(!Policy::new(&budget).may_open_unit(&l));
+        assert!(!Policy::new(Some(&budget)).may_open_unit(&l));
     }
 }

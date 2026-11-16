@@ -84,9 +84,10 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
-    /// Configure the query-wide I/O budget used to prefetch I/O ahead of
-    /// decoding (see [`TaskContext::io_budget`]). Without one (the default),
-    /// at most one I/O is outstanding at a time.
+    /// Configure the query-wide I/O budget within which I/O is fetched ahead
+    /// of decoding (see [`TaskContext::io_budget`]). Without one (the
+    /// default), each partition has at most one I/O in flight and alternates
+    /// between fetching and decoding.
     ///
     /// [`TaskContext::io_budget`]: datafusion_execution::TaskContext::io_budget
     pub fn with_io_budget(mut self, io_budget: Option<Arc<IoBudget>>) -> Self {
@@ -127,18 +128,16 @@ impl<'a> FileStreamBuilder<'a> {
         };
 
         let preserve_order = config.preserves_file_order();
-        // no prefetch without a budget, or with a limit (don't read ahead data
-        // that will not be needed)
-        let io_budget = io_budget
-            .filter(|budget| config.limit.is_none() && budget.is_enabled())
-            .unwrap_or_else(|| IoBudget::new(0));
-        // With prefetch, split files into independent morsels (e.g. one per
+        // no budget with a limit: don't read ahead data that will not be
+        // needed
+        let io_budget = io_budget.filter(|_| config.limit.is_none());
+        // With a budget, split files into independent morsels (e.g. one per
         // Parquet row group): this is what lets a scan fetch several parts of
         // a file concurrently and lets partitions balance the work. Scans that
         // must preserve order split too: the parts are fetched concurrently
         // but read strictly in planned order.
         let properties = morselizer.configure(&MorselizerOptions {
-            split_files: io_budget.is_enabled(),
+            split_files: io_budget.is_some(),
         });
         let read_order = if preserve_order {
             ReadOrder::Required

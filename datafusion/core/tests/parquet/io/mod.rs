@@ -479,21 +479,27 @@ impl ParquetIoTest {
     /// hint (512 KiB) covers the (small) test files entirely, hiding requests
     /// for the page index and Bloom filters.
     ///
-    /// Also disables I/O prefetch (`scan_io_budget_bytes = 0`): with prefetch,
+    /// Also disables the I/O budget (`enable_scan_io_budget = false`): with
+    /// prefetch,
     /// requests run concurrently and are recorded in a non-deterministic
     /// order. These tests document which bytes a query reads; see
     /// [`Self::new_with_io_budget`] and [`Self::query_reads`] for prefetch.
     pub(crate) async fn new(file_bytes: Bytes, config: SessionConfig) -> Self {
-        Self::new_with_io_budget(file_bytes, config, 0).await
+        Self::new_with_io_budget(file_bytes, config, None).await
     }
 
-    /// Like [`Self::new`], with an I/O prefetch budget of `io_budget_bytes`.
+    /// Like [`Self::new`], with an I/O budget of `io_budget_bytes` (`None`:
+    /// no budget).
     pub(crate) async fn new_with_io_budget(
         file_bytes: Bytes,
         mut config: SessionConfig,
-        io_budget_bytes: usize,
+        io_budget_bytes: Option<usize>,
     ) -> Self {
-        config.options_mut().execution.scan_io_budget_bytes = io_budget_bytes;
+        let execution = &mut config.options_mut().execution;
+        execution.enable_scan_io_budget = io_budget_bytes.is_some();
+        if let Some(bytes) = io_budget_bytes {
+            execution.scan_io_budget_bytes = bytes;
+        }
         let file_size = file_bytes.len() as u64;
         let layout = ParquetFileLayout::new(&file_bytes);
         config.options_mut().execution.parquet.metadata_size_hint =

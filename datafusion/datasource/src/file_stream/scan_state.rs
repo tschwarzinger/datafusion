@@ -14,7 +14,6 @@ use futures::StreamExt as _;
 use super::work_pool::{PoolConfig, PoolStep, SharedPool, UnitId, WorkPool};
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError, StartableTime};
-use datafusion_execution::IoBudget;
 
 pub(super) use super::work_pool::ReadOrder;
 
@@ -25,30 +24,27 @@ pub(super) use super::work_pool::ReadOrder;
 /// It drives the lifecycle of scanning files: unopened files (from the
 /// [`WorkSource`]), CPU-ready planners, planner I/O, ready morsels and the
 /// active reader. Everything but the active reader lives in a [`WorkPool`],
-/// which is private to this stream, or — for scans with an I/O budget that
-/// share work between partitions — shared with all sibling streams.
+/// which is private to this stream, or — for scans that share work between
+/// partitions — shared with all sibling streams.
 ///
 /// # I/O budget
 ///
-/// Every stream may always have one unit of work (an I/O in flight, or a
-/// morsel ready or being read), as without prefetch: with a zero budget each
-/// partition alternates between fetching and decoding.
+/// Without a budget, every stream has one unit of work (an I/O in flight, or
+/// a morsel ready or being read): each partition alternates between fetching
+/// and decoding.
 ///
-/// With a budget, I/O is issued ahead of decoding (the next row
-/// groups of the current file, further files) as long as
+/// With a budget, I/O is issued ahead of decoding (the next row groups of the
+/// current file, further files) as long as
 ///
 /// ```text
 /// bytes of in-flight I/O + bytes buffered in ready morsels and readers <= budget
 /// ```
 ///
-/// Regardless of the budget, each stream sharing a pool may have one unit of
-/// work (an I/O in flight, or a morsel ready or being read), as without a
-/// budget: a small budget is never slower than none, and items larger than
-/// the budget still make progress. I/O
-/// futures are lazy and only started once they fit the budget. Started I/O is
-/// spawned onto the Tokio runtime (when available) so it makes progress while
-/// streams decode. The budget is shared by all scans of the query (see
-/// [`IoBudget`]).
+/// When the budget is used up, one I/O at a time may still start in the whole
+/// query, so that it makes progress. I/O futures are lazy and only started
+/// once admitted. Started I/O is spawned onto the Tokio runtime (when
+/// available) so it makes progress while streams decode. The budget is shared
+/// by all scans of the query (see [`IoBudget`]).
 ///
 /// [`IoBudget`]: datafusion_execution::IoBudget
 ///
@@ -100,6 +96,9 @@ pub(super) struct ScanState {
     waiter: usize,
     /// The morsel this stream is reading, if any.
     reader: Option<ActiveReader>,
+    /// Whether this stream spawned I/O since it last yielded (see
+    /// `poll_scan`).
+    yield_before_read: bool,
     /// Set once the work source has no more files.
     source_done: bool,
     /// Metrics for the active scan queues.
@@ -134,7 +133,7 @@ impl ScanState {
     ) -> Self {
         if remain.is_some() {
             // avoid reading ahead data that will not be needed
-            config.io_budget = IoBudget::new(0);
+            config.io_budget = None;
         }
         // Siblings share their outstanding work unless the order matters (or
         // a limit applies, whose file accounting is per stream).
@@ -167,6 +166,7 @@ impl ScanState {
             pool,
             waiter,
             reader: None,
+            yield_before_read: false,
             source_done: false,
             metrics,
         }
@@ -218,6 +218,7 @@ impl ScanState {
                 return ret;
             }
             if guard.start_io(&pool) {
+                self.yield_before_read = true;
                 return ScanAndReturn::Continue;
             }
             if let Some((unit, planner)) = guard.take_planner(reading) {
@@ -235,6 +236,16 @@ impl ScanState {
         }
 
         // 4. active reader
+        if self.yield_before_read && self.reader.is_some() {
+            // Yield once before decoding, so the worker thread runs the I/O
+            // tasks this stream just spawned first: Tokio places a task
+            // spawned from a worker in that worker's LIFO slot, from which
+            // other workers can't steal it, so the I/O would otherwise only
+            // start once this stream yields, i.e. after decoding.
+            self.yield_before_read = false;
+            cx.waker().wake_by_ref();
+            return ScanAndReturn::Return(Poll::Pending);
+        }
         if let Some(ret) = self.poll_reader(cx) {
             return ret;
         }
@@ -301,6 +312,7 @@ impl ScanState {
             return ScanAndReturn::Continue;
         }
         guard.register(self.waiter, cx.waker(), !self.source_done);
+        self.yield_before_read = false;
         ScanAndReturn::Return(Poll::Pending)
     }
 

@@ -56,9 +56,9 @@ pub struct TaskContext {
     window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
-    /// Query-wide I/O prefetch budget, created on first use from
+    /// Query-wide scan I/O budget, created on first use from
     /// `datafusion.execution.scan_io_budget_bytes`.
-    io_budget: OnceLock<Arc<IoBudget>>,
+    io_budget: OnceLock<Option<Arc<IoBudget>>>,
 }
 
 impl Default for TaskContext {
@@ -151,18 +151,24 @@ impl TaskContext {
         &self.window_functions
     }
 
-    /// Return the query-wide [`IoBudget`] for prefetching scan I/O.
+    /// Return the query-wide [`IoBudget`] for scan I/O, or `None` if
+    /// `datafusion.execution.enable_scan_io_budget` is `false`.
     ///
     /// A `TaskContext` is created per query (see [`SessionContext::task_ctx`])
     /// and shared by all its operators, so all scans of a query share this
     /// budget. Its limit is `datafusion.execution.scan_io_budget_bytes` at the
-    /// time of the first call; `0` disables prefetching.
+    /// time of the first call.
     ///
     /// [`SessionContext::task_ctx`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html#method.task_ctx
-    pub fn io_budget(&self) -> &Arc<IoBudget> {
-        self.io_budget.get_or_init(|| {
-            IoBudget::new(self.session_config.options().execution.scan_io_budget_bytes)
-        })
+    pub fn io_budget(&self) -> Option<&Arc<IoBudget>> {
+        self.io_budget
+            .get_or_init(|| {
+                let options = &self.session_config.options().execution;
+                options
+                    .enable_scan_io_budget
+                    .then(|| IoBudget::new(options.scan_io_budget_bytes))
+            })
+            .as_ref()
     }
 
     /// Update the [`SessionConfig`]

@@ -137,7 +137,7 @@ async fn test_row_group_pruning_io_prefetch_reads_the_same_ranges() {
     let with = ParquetIoTest::new_with_io_budget(
         three_row_group_file(),
         config(),
-        1024 * 1024 * 1024,
+        Some(1024 * 1024 * 1024),
     )
     .await;
     for sql in [
