@@ -13,6 +13,7 @@ use crate::ParquetFileSchemaProvider;
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
+use crate::pruning::PruningPredicateCache;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
@@ -660,6 +661,10 @@ impl FileSource for ParquetSource {
             memory_pool: self.memory_pool.clone(),
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
+            pruning_predicate_cache: Arc::new(PruningPredicateCache::new(
+                self.enable_page_index(),
+                self.max_in_list_size(),
+            )),
         }))
     }
 

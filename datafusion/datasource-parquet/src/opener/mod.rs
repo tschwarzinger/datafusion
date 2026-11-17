@@ -15,6 +15,7 @@ use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
 use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::pruning::PruningPredicateCache;
 use crate::push_decoder::{
     DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, RgPlanEntry,
     RowFilterContext, RowGroupPruner, RowGroupReverser,
@@ -309,6 +310,8 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    /// Pruning predicates shared by the files this partition opens.
+    pub(crate) pruning_predicate_cache: Arc<PruningPredicateCache>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -463,6 +466,7 @@ struct PreparedParquetOpen {
     /// the logical-with-virtual schema. `None` when no virtual columns were
     /// requested.
     virtual_state: Option<Arc<VirtualColumnsState>>,
+    pruning_predicate_cache: Arc<PruningPredicateCache>,
     reorder_predicates: bool,
     pushdown_filters: bool,
     force_filter_selections: bool,
@@ -1006,6 +1010,7 @@ impl ParquetMorselizer {
             projection,
             predicate,
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
+            pruning_predicate_cache: Arc::clone(&self.pruning_predicate_cache),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
             force_filter_selections: self.force_filter_selections,
@@ -1248,26 +1253,18 @@ impl MetadataLoadedParquetOpen {
             prepared.stats_prove_unsatisfiable = false;
         }
 
-        // Build predicates for this specific file
-        let pruning_predicate = build_pruning_predicates(
-            prepared.predicate.as_ref(),
-            &physical_file_schema,
-            &prepared.predicate_creation_errors,
-            prepared.max_in_list_size,
-        );
-
-        // Only build page pruning predicate if page index is enabled
-        let page_pruning_predicate = if prepared.enable_page_index {
-            prepared.predicate.as_ref().and_then(|predicate| {
-                let p = build_page_pruning_predicate(
+        // Build predicates for this specific file, or reuse those of an
+        // earlier file with the same schema and predicate.
+        let (pruning_predicate, page_pruning_predicate) = match &prepared.predicate {
+            Some(predicate) => {
+                let predicates = prepared.pruning_predicate_cache.get_or_build(
                     predicate,
                     &physical_file_schema,
-                    prepared.max_in_list_size,
+                    &prepared.predicate_creation_errors,
                 );
-                (p.filter_number() > 0).then_some(p)
-            })
-        } else {
-            None
+                (predicates.row_groups.clone(), predicates.pages.clone())
+            }
+            None => (None, None),
         };
 
         Ok(FiltersPreparedParquetOpen {
@@ -2145,6 +2142,7 @@ fn create_initial_plan(
 /// Build a page pruning predicate from an optional predicate expression.
 /// If the predicate is None or the predicate cannot be converted to a page pruning
 /// predicate, return None.
+#[cfg(test)]
 pub(crate) fn build_page_pruning_predicate(
     predicate: &Arc<dyn PhysicalExpr>,
     file_schema: &SchemaRef,
@@ -2750,6 +2748,10 @@ mod test {
                 memory_pool: self.memory_pool.clone(),
                 sort_order_for_reorder: None,
                 virtual_state,
+                pruning_predicate_cache: Arc::new(PruningPredicateCache::new(
+                    self.enable_page_index,
+                    self.max_in_list_size,
+                )),
             })
         }
     }
