@@ -19,7 +19,9 @@ use crate::push_decoder::{
     DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, RgPlanEntry,
     RowFilterContext, RowGroupPruner, RowGroupReverser,
 };
-use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
+use crate::row_group_filter::{
+    RowGroupAccessPlanFilter, bloom_filter_columns, row_group_in_range,
+};
 use crate::{
     BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
     ParquetFileReaderFactory, ParquetRowSelection, ParquetVirtualColumn, RowGroupAccess,
@@ -1526,9 +1528,14 @@ impl RowGroupsPrunedParquetOpen {
         let mut row_group_bloom_filters =
             vec![BloomFilterStatistics::new(); num_row_groups];
 
-        if let Some(predicate) =
-            self.prepared.pruning_predicate.as_ref().map(|p| p.as_ref())
-            && self.prepared.loaded.prepared.enable_bloom_filter
+        let bloom_columns = self
+            .prepared
+            .pruning_predicate
+            .as_ref()
+            .filter(|_| self.prepared.loaded.prepared.enable_bloom_filter)
+            .map(|predicate| bloom_filter_columns(predicate))
+            .unwrap_or_default();
+        if !bloom_columns.is_empty()
             && !self.row_groups.is_empty()
             && self
                 .row_groups
@@ -1553,8 +1560,7 @@ impl RowGroupsPrunedParquetOpen {
                 mem::replace(&mut prepared.async_file_reader, replacement_reader),
                 reader_metadata,
             );
-            let parquet_columns: Vec<(String, usize, Type, i32)> = predicate
-                .literal_columns()
+            let parquet_columns: Vec<(String, usize, Type, i32)> = bloom_columns
                 .into_iter()
                 .filter_map(|column_name| {
                     let parquet_schema = builder.parquet_schema();

@@ -583,8 +583,8 @@ macro_rules! int_tests {
         #[tokio::test]
         async fn $fn_eq_in_list_negated() {
             // result of sql "SELECT * FROM t where not in (1)" prune nothing
-            // Groups without 1 are fully matched by statistics and skip Bloom.
-            // Only [0, 5) contains 1, so only that group is Bloom-evaluated.
+            // NOT IN has no `IN` guarantee for Bloom filters to decide, so no
+            // Bloom filter is loaded or evaluated.
             RowGroupPruningTest::new()
                 .with_scenario(Scenario::Int)
                 .with_query(&format!("SELECT * FROM t where i{} not in (1)", $bits))
@@ -592,7 +592,7 @@ macro_rules! int_tests {
                 .with_matched_by_stats(Some(4))
                 .with_pruned_by_stats(Some(0))
                 .with_pruned_files(Some(0))
-                .with_matched_by_bloom_filter(Some(1))
+                .with_matched_by_bloom_filter(Some(0))
                 .with_pruned_by_bloom_filter(Some(0))
                 .with_expected_rows(19)
                 .test_row_group_prune()
@@ -753,8 +753,8 @@ macro_rules! uint_tests {
         #[tokio::test]
         async fn $fn_eq_in_list_negated() {
             // result of sql "SELECT * FROM t where not in (6)" prune nothing
-            // Groups without 6 are fully matched by statistics and skip Bloom.
-            // Only [5, 10) contains 6, so only that group is Bloom-evaluated.
+            // NOT IN has no `IN` guarantee for Bloom filters to decide, so no
+            // Bloom filter is loaded or evaluated.
             RowGroupPruningTest::new()
                 .with_scenario(Scenario::UInt)
                 .with_query(&format!("SELECT * FROM t where u{} not in (6)", $bits))
@@ -762,7 +762,7 @@ macro_rules! uint_tests {
                 .with_matched_by_stats(Some(4))
                 .with_pruned_by_stats(Some(0))
                 .with_pruned_files(Some(0))
-                .with_matched_by_bloom_filter(Some(1))
+                .with_matched_by_bloom_filter(Some(0))
                 .with_pruned_by_bloom_filter(Some(0))
                 .with_expected_rows(19)
                 .test_row_group_prune()
@@ -1298,9 +1298,9 @@ async fn prune_string_neq() {
         .with_matched_by_stats(Some(3))
         .with_pruned_by_stats(Some(0))
         .with_pruned_files(Some(0))
-        // 'all frontends' is fully matched (value outside min/max) and skips Bloom.
-        // 'mixed' and 'all backends' are Bloom-evaluated; != cannot Bloom-prune.
-        .with_matched_by_bloom_filter(Some(2))
+        // != has no `IN` guarantee for Bloom filters to decide, so no Bloom
+        // filter is loaded or evaluated.
+        .with_matched_by_bloom_filter(Some(0))
         .with_pruned_by_bloom_filter(Some(0))
         .with_expected_rows(14)
         .test_row_group_prune()
@@ -1408,9 +1408,9 @@ async fn prune_binary_neq() {
         .with_matched_by_stats(Some(3))
         .with_pruned_by_stats(Some(0))
         .with_pruned_files(Some(0))
-        // 'all frontends' is fully matched (value outside min/max) and skips Bloom.
-        // 'mixed' and 'all backends' are Bloom-evaluated; != cannot Bloom-prune.
-        .with_matched_by_bloom_filter(Some(2))
+        // != has no `IN` guarantee for Bloom filters to decide, so no Bloom
+        // filter is loaded or evaluated.
+        .with_matched_by_bloom_filter(Some(0))
         .with_pruned_by_bloom_filter(Some(0))
         .with_expected_rows(14)
         .test_row_group_prune()
@@ -1518,8 +1518,9 @@ async fn prune_fixedsizebinary_neq() {
         .with_pruned_by_stats(Some(0))
         .with_pruned_files(Some(0))
         // 'all frontends' and 'all backends' are fully matched ('be1' outside min/max).
-        // Only 'mixed' contains 'be1' and is Bloom-evaluated.
-        .with_matched_by_bloom_filter(Some(1))
+        // != has no `IN` guarantee for Bloom filters to decide, so no Bloom
+        // filter is loaded or evaluated.
+        .with_matched_by_bloom_filter(Some(0))
         .with_pruned_by_bloom_filter(Some(0))
         .with_expected_rows(14)
         .test_row_group_prune()

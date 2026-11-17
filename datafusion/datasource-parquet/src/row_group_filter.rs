@@ -16,6 +16,8 @@ use datafusion_common::parquet_config::RowGroupRangeAssignment;
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
+use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
 use datafusion_pruning::PruningPredicate;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::basic::ColumnOrder;
@@ -444,6 +446,12 @@ impl RowGroupAccessPlanFilter {
     /// Prune remaining row groups using loaded bloom filters and the
     /// [`PruningPredicate`].
     ///
+    /// A row group is pruned if, for some [`Guarantee::In`] of the predicate's
+    /// [literal guarantees](PruningPredicate::literal_guarantees), the Bloom
+    /// filter of the guarantee's column rules out every literal. The min/max
+    /// part of the predicate is not evaluated: [`BloomFilterStatistics`] have
+    /// no min/max values, so it can only prune if it is constant `false`.
+    ///
     /// Updates this set with row groups that should not be scanned.
     /// `row_group_bloom_filters[idx]` contains the bloom filters for the
     /// parquet row group at index `idx`.
@@ -460,6 +468,11 @@ impl RowGroupAccessPlanFilter {
         let _timer_guard = metrics.bloom_filter_eval_time.timer();
 
         assert_eq!(row_group_bloom_filters.len(), self.access_plan.len());
+        let always_false = predicate
+            .predicate_expr()
+            .downcast_ref::<Literal>()
+            .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(false)));
+        let in_guarantees = bloom_filter_guarantees(predicate).collect::<Vec<_>>();
         for (idx, stats) in row_group_bloom_filters.iter().enumerate() {
             if !self.access_plan.should_scan(idx) {
                 continue;
@@ -479,17 +492,14 @@ impl RowGroupAccessPlanFilter {
                 continue;
             }
 
-            // Can this group be pruned?
-            let prune_group = match predicate.prune(stats) {
-                Ok(values) => !values[0],
-                Err(e) => {
-                    log::debug!(
-                        "Error evaluating row group predicate on bloom filter: {e}"
-                    );
-                    metrics.predicate_evaluation_errors.add(1);
-                    continue;
-                }
-            };
+            let prune_group = always_false
+                || in_guarantees.iter().any(|guarantee| {
+                    stats
+                        .contained(&guarantee.column, &guarantee.literals)
+                        .is_some_and(|contained| {
+                            contained.iter().all(|value| value == Some(false))
+                        })
+                });
 
             if prune_group {
                 metrics.row_groups_pruned_bloom_filter.add_pruned(1);
@@ -499,6 +509,29 @@ impl RowGroupAccessPlanFilter {
             }
         }
     }
+}
+
+/// Returns the [`Guarantee::In`] literal guarantees of `predicate`, the only
+/// ones a Bloom filter can decide: it can prove that a value is absent, but
+/// not that a column holds nothing but the literals of a `NotIn` guarantee.
+fn bloom_filter_guarantees(
+    predicate: &PruningPredicate,
+) -> impl Iterator<Item = &LiteralGuarantee> {
+    predicate
+        .literal_guarantees()
+        .iter()
+        .filter(|guarantee| guarantee.guarantee == Guarantee::In)
+}
+
+/// Returns the distinct names of the columns whose Bloom filters
+/// [`RowGroupAccessPlanFilter::prune_by_bloom_filters`] can use.
+pub(crate) fn bloom_filter_columns(predicate: &PruningPredicate) -> Vec<String> {
+    let mut seen = HashSet::new();
+    bloom_filter_guarantees(predicate)
+        .map(|guarantee| guarantee.column.name.as_str())
+        .filter(|name| seen.insert(*name))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Wraps a slice of [`RowGroupMetaData`] in a way that implements [`PruningStatistics`].
@@ -1660,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn bloom_filter_pruning_error_retains_row_group_without_match() {
+    fn bloom_filter_pruning_does_not_evaluate_min_max_predicate() {
         let schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
         // c1 = CAST('abc' AS Int32): constant folding fails, so the
@@ -1680,8 +1713,6 @@ mod tests {
             .try_build(expr)
             .unwrap();
 
-        // A nonempty map bypasses the no-filter path. Evaluating the predicate
-        // then fails because 'abc' is not an Int32.
         let mut sbbf = Sbbf::new_with_ndv_fpp(10, 0.01).unwrap();
         sbbf.insert(&1_i32);
         let mut bloom_statistics = BloomFilterStatistics::new();
@@ -1696,12 +1727,108 @@ mod tests {
             &[bloom_statistics],
         );
 
-        // An evaluation failure is conservative: retain the row group, report
-        // the error separately, and do not call the result a Bloom match.
-        assert_pruned(row_groups, ExpectedPruning::Some(vec![0]));
-        assert_eq!(metrics.predicate_evaluation_errors.value(), 1);
+        // Without a literal guarantee, the Bloom filters cannot prune and the
+        // failing min/max predicate is never evaluated.
+        assert_pruned(row_groups, ExpectedPruning::None);
+        assert_eq!(metrics.predicate_evaluation_errors.value(), 0);
         assert_eq!(metrics.row_groups_pruned_bloom_filter.pruned(), 0);
-        assert_eq!(metrics.row_groups_pruned_bloom_filter.matched(), 0);
+        assert_eq!(metrics.row_groups_pruned_bloom_filter.matched(), 1);
+    }
+
+    #[test]
+    fn bloom_filter_columns_only_include_in_guarantees() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, false),
+            Field::new("c2", DataType::Int32, false),
+            Field::new("c3", DataType::Int32, false),
+        ]));
+        let expr = col("c1")
+            .in_list(vec![lit(1), lit(2)], false)
+            .and(col("c2").not_eq(lit(3)))
+            .and(col("c1").gt(lit(0)))
+            .and(col("c3").eq(lit(4)).or(col("c2").eq(lit(5))));
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .build(logical2physical(&expr, &schema))
+            .unwrap();
+
+        assert_eq!(bloom_filter_columns(&pruning_predicate), vec!["c1"]);
+    }
+
+    /// Bloom filter pruning with only the `In` literal guarantees must prune
+    /// the same row groups as evaluating the whole [`PruningPredicate`]
+    /// against the [`BloomFilterStatistics`].
+    #[test]
+    fn bloom_filter_pruning_matches_full_predicate_evaluation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, true),
+            Field::new("c2", DataType::Int32, true),
+        ]));
+        let predicates = [
+            col("c1").eq(lit(15)),
+            col("c1").in_list(vec![lit(1), lit(15)], false),
+            col("c1").in_list((100..120).map(lit).collect(), false),
+            col("c1").in_list(vec![lit(1), lit(15)], true),
+            col("c1").not_eq(lit(1)),
+            col("c1").eq(lit(15)).and(col("c2").eq(lit(3))),
+            col("c1").eq(lit(15)).or(col("c2").eq(lit(3))),
+            col("c1").eq(lit(1)).or(col("c1").eq(lit(15))),
+            col("c1").eq(lit(15)).and(col("c1").gt(lit(5))),
+            col("c1").gt(lit(5)).and(col("c2").lt(lit(5))),
+            col("c1").is_null().or(col("c1").eq(lit(15))),
+            col("c1").is_not_null().and(col("c2").eq(lit(15))),
+            col("c1").eq(lit(15)).and(lit(false)),
+            lit(false),
+            lit(true),
+        ];
+
+        let bloom_filter = |values: &[i32]| {
+            let mut sbbf = Sbbf::new_with_ndv_fpp(10, 0.01).unwrap();
+            for value in values {
+                sbbf.insert(value);
+            }
+            sbbf
+        };
+        let row_group = |c1: Option<&[i32]>, c2: Option<&[i32]>| {
+            let mut statistics = BloomFilterStatistics::new();
+            if let Some(values) = c1 {
+                statistics.insert("c1", bloom_filter(values), PhysicalType::INT32, 4);
+            }
+            if let Some(values) = c2 {
+                statistics.insert("c2", bloom_filter(values), PhysicalType::INT32, 4);
+            }
+            statistics
+        };
+        let row_groups = [
+            row_group(Some(&[1, 2]), Some(&[3])),
+            row_group(Some(&[15]), Some(&[4])),
+            row_group(Some(&[1]), None),
+            row_group(None, Some(&[1])),
+            row_group(Some(&[7]), Some(&[7])),
+            row_group(Some(&[105]), Some(&[15])),
+        ];
+
+        for predicate in predicates {
+            let pruning_predicate = PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&schema))
+                .try_build(logical2physical(&predicate, &schema))
+                .unwrap();
+            let expected = row_groups
+                .iter()
+                .map(|stats| pruning_predicate.prune(stats).unwrap()[0])
+                .collect::<Vec<_>>();
+
+            let metrics = parquet_file_metrics();
+            let mut filter = RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(
+                row_groups.len(),
+            ));
+            filter.prune_by_bloom_filters(&pruning_predicate, &metrics, &row_groups);
+            let actual = (0..row_groups.len())
+                .map(|idx| filter.access_plan.should_scan(idx))
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual, expected, "predicate: {predicate}");
+        }
     }
 
     fn get_row_group_meta_data(
