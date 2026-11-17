@@ -10,6 +10,7 @@ use crate::bloom_filter::BloomFilterStatistics;
 use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_order};
 use crate::pruning::build_inverted_predicate;
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
+use arrow::compute::kernels::cmp::eq;
 use arrow::compute::nullif;
 use arrow::datatypes::Schema;
 use datafusion_common::parquet_config::RowGroupRangeAssignment;
@@ -411,21 +412,28 @@ impl RowGroupAccessPlanFilter {
             return;
         }
         let arrow_schema = pruning_stats.arrow_schema;
+        let candidate_stats = |indices: &[usize]| RowGroupPruningStatistics {
+            parquet_schema: pruning_stats.parquet_schema,
+            column_orders: pruning_stats.column_orders,
+            row_group_metadatas: indices.iter().map(|&i| &groups[i]).collect::<Vec<_>>(),
+            arrow_schema,
+        };
+
+        let candidate_row_group_indices = single_valued_in_guarantee_columns(
+            candidate_row_group_indices,
+            &candidate_stats(candidate_row_group_indices),
+            predicate,
+        );
+        if candidate_row_group_indices.is_empty() {
+            return;
+        }
 
         let Some(inverted_predicate) = build_inverted_predicate(predicate, arrow_schema)
         else {
             return;
         };
 
-        let inverted_pruning_stats = RowGroupPruningStatistics {
-            parquet_schema: pruning_stats.parquet_schema,
-            column_orders: pruning_stats.column_orders,
-            row_group_metadatas: candidate_row_group_indices
-                .iter()
-                .map(|&i| &groups[i])
-                .collect::<Vec<_>>(),
-            arrow_schema,
-        };
+        let inverted_pruning_stats = candidate_stats(&candidate_row_group_indices);
 
         let Ok(inverted_values) = inverted_predicate.prune(&inverted_pruning_stats)
         else {
@@ -472,7 +480,9 @@ impl RowGroupAccessPlanFilter {
             .predicate_expr()
             .downcast_ref::<Literal>()
             .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(false)));
-        let in_guarantees = bloom_filter_guarantees(predicate).collect::<Vec<_>>();
+        // A Bloom filter can prove that a value is absent, but not that a
+        // column holds nothing but the literals of a `NotIn` guarantee.
+        let guarantees = in_guarantees(predicate).collect::<Vec<_>>();
         for (idx, stats) in row_group_bloom_filters.iter().enumerate() {
             if !self.access_plan.should_scan(idx) {
                 continue;
@@ -493,7 +503,7 @@ impl RowGroupAccessPlanFilter {
             }
 
             let prune_group = always_false
-                || in_guarantees.iter().any(|guarantee| {
+                || guarantees.iter().any(|guarantee| {
                     stats
                         .contained(&guarantee.column, &guarantee.literals)
                         .is_some_and(|contained| {
@@ -511,10 +521,8 @@ impl RowGroupAccessPlanFilter {
     }
 }
 
-/// Returns the [`Guarantee::In`] literal guarantees of `predicate`, the only
-/// ones a Bloom filter can decide: it can prove that a value is absent, but
-/// not that a column holds nothing but the literals of a `NotIn` guarantee.
-fn bloom_filter_guarantees(
+/// Returns the [`Guarantee::In`] literal guarantees of `predicate`.
+fn in_guarantees(
     predicate: &PruningPredicate,
 ) -> impl Iterator<Item = &LiteralGuarantee> {
     predicate
@@ -523,11 +531,53 @@ fn bloom_filter_guarantees(
         .filter(|guarantee| guarantee.guarantee == Guarantee::In)
 }
 
+/// Returns the candidates in which every column of a [`Guarantee::In`] of
+/// `predicate` may hold a single value.
+///
+/// Such a guarantee means that a row can only match if its column holds one of
+/// the literals. Statistics can only prove that for every row of a row group if
+/// the column's minimum and maximum are the same literal, so a row group whose
+/// minimum and maximum differ cannot be proven fully matched. Dropping those
+/// row groups up front saves inverting the predicate for point lookups and
+/// `IN` lists, such as dynamic join filters, which rarely match a whole row
+/// group. `stats` holds the statistics of the `candidates`.
+fn single_valued_in_guarantee_columns(
+    candidates: &[usize],
+    stats: &RowGroupPruningStatistics<'_>,
+    predicate: &PruningPredicate,
+) -> Vec<usize> {
+    let mut keep = vec![true; candidates.len()];
+    let mut seen = HashSet::new();
+    for guarantee in in_guarantees(predicate) {
+        if !seen.insert(&guarantee.column) {
+            continue;
+        }
+        let (Some(min), Some(max)) = (
+            stats.min_values(&guarantee.column),
+            stats.max_values(&guarantee.column),
+        ) else {
+            continue;
+        };
+        let Ok(single_valued) = eq(&min, &max) else {
+            continue;
+        };
+        for (keep, single_valued) in keep.iter_mut().zip(single_valued.iter()) {
+            // Unknown bounds are left to the inverted predicate.
+            *keep &= single_valued != Some(false);
+        }
+    }
+    candidates
+        .iter()
+        .zip(keep)
+        .filter_map(|(&idx, keep)| keep.then_some(idx))
+        .collect()
+}
+
 /// Returns the distinct names of the columns whose Bloom filters
 /// [`RowGroupAccessPlanFilter::prune_by_bloom_filters`] can use.
 pub(crate) fn bloom_filter_columns(predicate: &PruningPredicate) -> Vec<String> {
     let mut seen = HashSet::new();
-    bloom_filter_guarantees(predicate)
+    in_guarantees(predicate)
         .map(|guarantee| guarantee.column.name.as_str())
         .filter(|name| seen.insert(*name))
         .map(str::to_string)
@@ -951,6 +1001,90 @@ mod tests {
 
         assert_eq!(row_groups.access_plan.row_group_indexes(), vec![0, 1, 2]);
         assert_eq!(row_groups.is_fully_matched(), &vec![false, true, false]);
+    }
+
+    /// Skipping row groups whose `IN` guarantee columns hold several values
+    /// must not change which row groups are fully matched.
+    #[test]
+    fn row_group_fully_matched_skips_multi_valued_in_guarantee_columns() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int32, false),
+            Field::new("c2", DataType::Int32, false),
+        ]));
+        let schema_descr = get_test_schema_descr(vec![
+            PrimitiveTypeField::new("c1", PhysicalType::INT32),
+            PrimitiveTypeField::new("c2", PhysicalType::INT32),
+        ]);
+        let row_group = |c1: (i32, i32), c2: (i32, i32)| {
+            let stats = |(min, max)| {
+                ParquetStatistics::int32(Some(min), Some(max), None, Some(0), false)
+            };
+            get_row_group_meta_data(&schema_descr, vec![stats(c1), stats(c2)])
+        };
+        let groups = [
+            row_group((5, 5), (1, 1)),
+            row_group((5, 6), (1, 3)),
+            row_group((6, 6), (2, 9)),
+            row_group((1, 9), (0, 0)),
+            row_group((7, 7), (5, 5)),
+        ];
+        let predicates = [
+            col("c1").eq(lit(5)),
+            col("c1").in_list(vec![lit(5), lit(6)], false),
+            col("c1")
+                .in_list(vec![lit(5), lit(6)], false)
+                .and(col("c1").gt_eq(lit(5))),
+            col("c1").eq(lit(5)).and(col("c2").gt(lit(0))),
+            col("c1")
+                .in_list(vec![lit(5), lit(6)], false)
+                .and(col("c2").eq(lit(1))),
+            col("c1").gt_eq(lit(5)).and(col("c1").lt_eq(lit(6))),
+            col("c1").eq(lit(5)).or(col("c2").eq(lit(1))),
+            col("c1").not_eq(lit(7)),
+        ];
+
+        for predicate in predicates {
+            let pruning_predicate = build_test_pruning_predicate(
+                logical2physical(&predicate, &schema),
+                Arc::clone(&schema),
+            );
+
+            let metrics = parquet_file_metrics();
+            let mut row_groups =
+                RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(groups.len()));
+            row_groups.prune_by_statistics(
+                &schema,
+                &schema_descr,
+                &groups,
+                &pruning_predicate,
+                &metrics,
+            );
+
+            // Prove full matches for every remaining row group, without the shortcut.
+            let candidates = row_groups.access_plan.row_group_indexes();
+            let stats = RowGroupPruningStatistics {
+                parquet_schema: &schema_descr,
+                column_orders: None,
+                row_group_metadatas: candidates.iter().map(|&i| &groups[i]).collect(),
+                arrow_schema: &schema,
+            };
+            let mut expected = vec![false; groups.len()];
+            if let Some(inverted) = build_inverted_predicate(&pruning_predicate, &schema)
+            {
+                let values = inverted.prune(&stats).unwrap();
+                for (&idx, keep) in candidates.iter().zip(values) {
+                    expected[idx] = !keep;
+                }
+            }
+
+            assert_eq!(
+                row_groups.is_fully_matched(),
+                &expected,
+                "predicate: {predicate}"
+            );
+        }
     }
 
     #[test]
