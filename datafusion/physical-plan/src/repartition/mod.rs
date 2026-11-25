@@ -33,9 +33,13 @@ use crate::{
     PlanProperties, ReplaceChildrenOptions, Statistics, validate_child_count,
 };
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{
+    ArrayRef, PrimitiveArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
+};
 use arrow::compute::take_arrays;
 use arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
+use arrow_ord::ord::make_comparator;
+use arrow_ord::partition::partition;
 use arrow_schema::SortOptions;
 use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
@@ -575,6 +579,16 @@ impl RepartitionExecState {
             None
         };
 
+        let hash_keys_sorted = match partitioning {
+            Partitioning::Hash(exprs, _) if sorted_runs_enabled() => {
+                let (ordered, _) = input
+                    .equivalence_properties()
+                    .find_longest_permutation(exprs)?;
+                ordered.len() == exprs.len()
+            }
+            _ => false,
+        };
+
         // launch one async task per *input* partition
         let mut spawned_tasks = Vec::with_capacity(num_input_partitions);
         for (i, (stream, metrics)) in
@@ -613,6 +627,7 @@ impl RepartitionExecState {
                 // preserve_order depends on partition index to start from 0
                 if preserve_order { 0 } else { i },
                 num_input_partitions,
+                hash_keys_sorted,
             ));
 
             // In a separate task, wait for each input to be done
@@ -644,6 +659,9 @@ enum BatchPartitionerState {
         partition_reducer: StrengthReducedU64,
         hash_buffer: Vec<u64>,
         indices: Vec<Vec<u32>>,
+        /// Input is sorted on all of `exprs`, so rows with equal keys are
+        /// contiguous within each batch.
+        keys_sorted: bool,
     },
     RoundRobin {
         num_partitions: usize,
@@ -657,6 +675,14 @@ enum BatchPartitionerState {
         /// Row indices grouped by output partition
         indices: Vec<Vec<u32>>,
     },
+}
+
+// Prototype-only A/B switch.
+fn sorted_runs_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DF_REPARTITION_SORTED_RUNS").is_ok_and(|v| v != "0")
+    })
 }
 
 /// Fixed RandomState used for hash repartitioning to ensure consistent behavior across
@@ -788,7 +814,7 @@ impl RangeExpr {
     /// `on_columns`, to `partition_ids`.
     pub(crate) fn route_partition_ids(
         &self,
-        arrays: &[arrow::array::ArrayRef],
+        arrays: &[ArrayRef],
         partition_ids: &mut Vec<u64>,
     ) -> Result<()> {
         if self.router.split_points().is_empty() {
@@ -986,7 +1012,7 @@ impl StrengthReducedU64 {
         }
     }
 
-    #[cfg(test)]
+    #[inline]
     fn remainder(self, value: u64) -> u64 {
         match self {
             Self::PowerOfTwo { mask } => value & mask,
@@ -1007,6 +1033,20 @@ impl StrengthReducedU64 {
 
         ((high_product >> 64) + carry) as u64
     }
+}
+
+/// Below this average run length, run detection costs more than it saves.
+const SORTED_RUNS_MIN_AVG_LEN: usize = 2;
+/// Up to this many runs per batch, emit zero-copy slices instead of a `take`.
+const SORTED_RUNS_MAX_SLICES: usize = 32;
+
+type PartitionIter = Box<dyn Iterator<Item = Result<(usize, RecordBatch)>> + Send>;
+
+enum SortedRunsOutcome {
+    Done(Vec<Result<(usize, RecordBatch)>>),
+    /// `indices` were filled; finish with a grouped take.
+    Indices,
+    RunsTooShort,
 }
 
 impl BatchPartitioner {
@@ -1037,9 +1077,19 @@ impl BatchPartitioner {
                 partition_reducer: StrengthReducedU64::new(num_partitions as u64),
                 hash_buffer: vec![],
                 indices: vec![vec![]; num_partitions],
+                keys_sorted: false,
             },
             timer,
         })
+    }
+
+    /// Declare that the input is sorted on all hash expressions, so rows with
+    /// equal keys arrive in contiguous runs. Only affects hash partitioners.
+    pub(crate) fn with_hash_keys_sorted(mut self, sorted: bool) -> Self {
+        if let BatchPartitionerState::Hash { keys_sorted, .. } = &mut self.state {
+            *keys_sorted = sorted;
+        }
+        self
     }
 
     /// Create a new [`BatchPartitioner`] for round-robin repartitioning.
@@ -1251,12 +1301,41 @@ impl BatchPartitioner {
                     partition_reducer,
                     hash_buffer,
                     indices,
+                    keys_sorted,
                 } => {
                     // Tracking time required for distributing indexes across output partitions
                     let timer = self.timer.timer();
 
                     let arrays =
                         evaluate_expressions_to_arrays(exprs.as_slice(), &batch)?;
+
+                    if *keys_sorted {
+                        match Self::partition_sorted_runs(
+                            &batch,
+                            &arrays,
+                            *partition_reducer,
+                            hash_buffer,
+                            indices,
+                        )? {
+                            SortedRunsOutcome::Done(out) => {
+                                timer.done();
+                                return Ok(Box::new(out.into_iter()) as PartitionIter);
+                            }
+                            SortedRunsOutcome::Indices => {
+                                timer.done();
+                                let partitioned_batches = Self::partition_grouped_take(
+                                    &batch,
+                                    indices,
+                                    &self.timer,
+                                )?;
+                                return Ok(Box::new(partitioned_batches.into_iter())
+                                    as PartitionIter);
+                            }
+                            SortedRunsOutcome::RunsTooShort => {
+                                *keys_sorted = false;
+                            }
+                        }
+                    }
 
                     hash_buffer.clear();
                     hash_buffer.resize(batch.num_rows(), 0);
@@ -1315,6 +1394,80 @@ impl BatchPartitioner {
             };
 
         Ok(it)
+    }
+
+    /// Route a batch whose key columns are sorted, hashing one row per run of
+    /// equal keys instead of every row.
+    fn partition_sorted_runs(
+        batch: &RecordBatch,
+        arrays: &[ArrayRef],
+        reducer: StrengthReducedU64,
+        hash_buffer: &mut Vec<u64>,
+        indices: &mut [Vec<u32>],
+    ) -> Result<SortedRunsOutcome> {
+        let num_rows = batch.num_rows();
+        let random_state = REPARTITION_RANDOM_STATE.random_state();
+
+        // Sorted input: first row == last row implies a single run.
+        let mut single_run = true;
+        for array in arrays {
+            let cmp = make_comparator(array, array, SortOptions::default())?;
+            if cmp(0, num_rows - 1) != std::cmp::Ordering::Equal {
+                single_run = false;
+                break;
+            }
+        }
+        if single_run {
+            let first: Vec<ArrayRef> = arrays.iter().map(|a| a.slice(0, 1)).collect();
+            hash_buffer.clear();
+            hash_buffer.resize(1, 0);
+            create_hashes(&first, random_state, hash_buffer)?;
+            let partition = reducer.remainder(hash_buffer[0]) as usize;
+            return Ok(SortedRunsOutcome::Done(vec![Ok((
+                partition,
+                batch.clone(),
+            ))]));
+        }
+
+        let ranges = partition(arrays)?.ranges();
+        if ranges.len() * SORTED_RUNS_MIN_AVG_LEN > num_rows {
+            return Ok(SortedRunsOutcome::RunsTooShort);
+        }
+
+        let starts: UInt32Array = ranges.iter().map(|r| r.start as u32).collect();
+        let run_keys = take_arrays(arrays, &starts, None)?;
+        hash_buffer.clear();
+        hash_buffer.resize(ranges.len(), 0);
+        create_hashes(&run_keys, random_state, hash_buffer)?;
+
+        if ranges.len() <= SORTED_RUNS_MAX_SLICES {
+            let mut out = Vec::with_capacity(ranges.len());
+            let mut cur: Option<(usize, usize, usize)> = None;
+            for (range, hash) in ranges.iter().zip(hash_buffer.iter()) {
+                let partition = reducer.remainder(*hash) as usize;
+                cur = match cur {
+                    Some((p, start, _)) if p == partition => Some((p, start, range.end)),
+                    Some((p, start, end)) => {
+                        out.push(Ok((p, batch.slice(start, end - start))));
+                        Some((partition, range.start, range.end))
+                    }
+                    None => Some((partition, range.start, range.end)),
+                };
+            }
+            if let Some((p, start, end)) = cur {
+                out.push(Ok((p, batch.slice(start, end - start))));
+            }
+            return Ok(SortedRunsOutcome::Done(out));
+        }
+
+        for v in indices.iter_mut() {
+            v.clear();
+        }
+        for (range, hash) in ranges.iter().zip(hash_buffer.iter()) {
+            let partition = reducer.remainder(*hash) as usize;
+            indices[partition].extend(range.start as u32..range.end as u32);
+        }
+        Ok(SortedRunsOutcome::Indices)
     }
 
     // return the number of output partitions
@@ -2280,6 +2433,7 @@ impl RepartitionExec {
     /// output partitions based on the desired partitioning
     ///
     /// `output_channels` holds the output sending channels for each output partition
+    #[expect(clippy::too_many_arguments)]
     async fn pull_from_input(
         mut stream: SendableRecordBatchStream,
         mut output_channels: HashMap<usize, OutputChannel>,
@@ -2288,6 +2442,7 @@ impl RepartitionExec {
         metrics: RepartitionMetrics,
         input_partition: usize,
         num_input_partitions: usize,
+        hash_keys_sorted: bool,
     ) -> Result<()> {
         let mut partitioner = match (partitioning, range_router) {
             (Partitioning::Range(range_partitioning), Some(router)) => {
@@ -2305,7 +2460,8 @@ impl RepartitionExec {
                 metrics.repartition_time.clone(),
                 input_partition,
                 num_input_partitions,
-            )?,
+            )?
+            .with_hash_keys_sorted(hash_keys_sorted),
         };
 
         // While there are still outputs to send to, keep pulling inputs
