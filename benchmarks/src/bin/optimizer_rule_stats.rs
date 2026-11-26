@@ -115,7 +115,7 @@ fn rebuild_stats(
     subtree_fps(before, &mut b);
     subtree_fps(after, &mut a);
     let ptrs: HashSet<*const ()> =
-        b.iter().map(|(p, _)| Arc::as_ptr(p) as *const ()).collect();
+        b.iter().map(|(p, _)| Arc::as_ptr(p).cast::<()>()).collect();
     let fps: HashSet<u64> = b.iter().map(|(_, f)| *f).collect();
     let key = |p: &Arc<dyn ExecutionPlan>| {
         let mut h = DefaultHasher::new();
@@ -145,7 +145,7 @@ fn rebuild_stats(
         ..Default::default()
     };
     for (p, f) in &a {
-        if !ptrs.contains(&(Arc::as_ptr(p) as *const ())) {
+        if !ptrs.contains(&(Arc::as_ptr(p).cast::<()>())) {
             st.new_nodes += 1;
             let needless = fps.contains(f);
             let mine = props(p);
