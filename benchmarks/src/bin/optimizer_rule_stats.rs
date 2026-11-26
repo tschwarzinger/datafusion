@@ -16,11 +16,15 @@ use std::time::Duration;
 use datafusion_common::instant::Instant;
 
 use clap::Parser;
+use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{
+    Expr, ExprSchemable, ExpressionPlacement, JoinType, LogicalPlan,
+};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::physical_optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
 use datafusion::physical_plan::{ExecutionPlan, displayable};
@@ -114,6 +118,123 @@ struct LogRecord {
     name: String,
     dur: Duration,
     changed: bool,
+    trigger: Option<bool>,
+    trigger_dur: Duration,
+}
+
+fn any_node(plan: &LogicalPlan, f: impl Fn(&LogicalPlan) -> bool) -> bool {
+    let mut found = false;
+    plan.apply_with_subqueries(|n| {
+        if f(n) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .unwrap();
+    found
+}
+
+fn any_expr(plan: &LogicalPlan, f: impl Fn(&Expr) -> bool) -> bool {
+    let mut found = false;
+    plan.apply_with_subqueries(|n| {
+        n.apply_expressions(|e| {
+            e.apply(|x| {
+                if f(x) {
+                    found = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            })
+        })
+    })
+    .unwrap();
+    found
+}
+
+fn has_distinct_agg(exprs: &[Expr]) -> bool {
+    exprs.iter().any(|e| {
+        e.exists(|x| Ok(matches!(x, Expr::AggregateFunction(af) if af.params.distinct)))
+            .unwrap()
+    })
+}
+
+/// A cheap, conservative "might this rule change the plan?" check, derived from
+/// the node/expression shapes each rule matches on. `None`: no cheap check.
+fn trigger(rule: &str, plan: &LogicalPlan) -> Option<bool> {
+    use LogicalPlan as P;
+    Some(match rule {
+        "rewrite_set_comparison" => {
+            any_expr(plan, |e| matches!(e, Expr::SetComparison(_)))
+        }
+        "optimize_unions" => any_node(plan, |n| matches!(n, P::Union(_))),
+        "replace_distinct_aggregate" => any_node(plan, |n| matches!(n, P::Distinct(_))),
+        "eliminate_join" | "eliminate_cross_join" => {
+            any_node(plan, |n| matches!(n, P::Join(_)))
+        }
+        "decorrelate_predicate_subquery" => any_expr(plan, |e| {
+            matches!(
+                e,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::SetComparison(_)
+            )
+        }),
+        "scalar_subquery_to_join" => {
+            any_expr(plan, |e| matches!(e, Expr::ScalarSubquery(_)))
+        }
+        "decorrelate_lateral_join" => any_node(plan, |n| matches!(n, P::Subquery(_))),
+        "extract_equijoin_predicate" => {
+            any_node(plan, |n| matches!(n, P::Join(j) if j.filter.is_some()))
+        }
+        "eliminate_duplicated_expr" => {
+            any_node(plan, |n| matches!(n, P::Sort(_) | P::Aggregate(_)))
+        }
+        "eliminate_filter" => any_node(plan, |n| match n {
+            P::Filter(f) => f
+                .predicate
+                .exists(|e| {
+                    Ok(matches!(e, Expr::Literal(v, _)
+                        if v.is_null() || matches!(v, ScalarValue::Boolean(_))))
+                })
+                .unwrap(),
+            _ => false,
+        }),
+        "eliminate_limit" | "push_down_limit" => {
+            any_node(plan, |n| matches!(n, P::Limit(_)))
+        }
+        "propagate_empty_relation" => {
+            any_node(plan, |n| matches!(n, P::EmptyRelation(_)))
+        }
+        "filter_null_join_keys" => any_node(plan, |n| match n {
+            P::Join(j) => j.on.iter().any(|(l, r)| {
+                l.nullable(j.left.schema()).unwrap_or(true)
+                    || r.nullable(j.right.schema()).unwrap_or(true)
+            }),
+            _ => false,
+        }),
+        "eliminate_outer_join" => any_node(
+            plan,
+            |n| matches!(n, P::Join(j) if matches!(j.join_type, JoinType::Left | JoinType::Right | JoinType::Full)),
+        ),
+        "eliminate_aggregate_distinct" | "single_distinct_aggregation_to_group_by" => {
+            any_node(
+                plan,
+                |n| matches!(n, P::Aggregate(a) if has_distinct_agg(&a.aggr_expr)),
+            )
+        }
+        "eliminate_group_by_constant" => any_node(plan, |n| {
+            matches!(n, P::Aggregate(a) if a.group_expr.len() >= 2
+                && a.group_expr.iter().any(|g| !matches!(g, Expr::Column(_))))
+        }),
+        "extract_leaf_expressions" | "push_down_leaf_projections" => {
+            any_expr(plan, |e| {
+                e.placement() == ExpressionPlacement::MoveTowardsLeafNodes
+            })
+        }
+        "replace_filter_top1" => any_node(plan, |n| matches!(n, P::Window(_))),
+        _ => return None,
+    })
 }
 
 /// Runs the logical optimizer once, recording time and change per rule
@@ -128,6 +249,9 @@ fn observe_logical(state: &SessionState, plan: &LogicalPlan) -> Result<Vec<LogRe
         .optimizer()
         .optimize(plan.clone(), state, |new, rule| {
             let dur = last_end.elapsed();
+            let t = Instant::now();
+            let trig = trigger(rule.name(), &prev);
+            let trigger_dur = t.elapsed();
             let changed = *new != prev;
             if changed {
                 prev = new.clone();
@@ -137,6 +261,8 @@ fn observe_logical(state: &SessionState, plan: &LogicalPlan) -> Result<Vec<LogRe
                 name: rule.name().to_string(),
                 dur,
                 changed,
+                trigger: trig,
+                trigger_dur,
             });
             idx += 1;
             last_end = Instant::now();
@@ -235,13 +361,15 @@ async fn main() -> Result<()> {
         for i in 0..n {
             let rec = &runs[0][i];
             let dur = median(runs.iter().map(|r| r[i].dur).collect());
+            let trig_dur = median(runs.iter().map(|r| r[i].trigger_dur).collect());
             if rec.changed {
                 changed_rules.push(Arc::clone(&all_rules[i % all_rules.len()]));
             }
             println!(
                 "{}",
                 json!({"q": q, "phase": "logical", "pass": rec.pass, "rule": rec.name,
-                       "ns": dur.as_nanos() as u64, "changed": rec.changed})
+                       "ns": dur.as_nanos() as u64, "changed": rec.changed,
+                       "trigger": rec.trigger, "trigger_ns": trig_dur.as_nanos() as u64})
             );
         }
 
