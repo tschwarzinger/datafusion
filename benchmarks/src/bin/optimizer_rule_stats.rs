@@ -29,7 +29,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::physical_optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
-use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::*;
 use datafusion_benchmarks::tpch::{TPCH_TABLES, get_tpch_table_schema};
 use datafusion_common::Result;
@@ -48,6 +48,11 @@ struct Args {
     iterations: usize,
     #[arg(long, default_value_t = 4)]
     partitions: usize,
+    /// Only run physical planning of this query `--loops` times (for profilers)
+    #[arg(long)]
+    profile_query: Option<usize>,
+    #[arg(long, default_value_t = 100)]
+    loops: usize,
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -68,6 +73,98 @@ struct PhysRecord {
     dur: Duration,
     ptr_same: bool,
     changed: bool,
+    rebuild: RebuildStats,
+}
+
+/// How many nodes of a rule's output are fresh allocations, and how many of
+/// those equal (same node description, same descendants) an input subtree.
+#[derive(Clone, Debug, Default)]
+struct RebuildStats {
+    nodes: usize,
+    new_nodes: usize,
+    needless: usize,
+    /// new nodes whose counterpart in the input (same description and schema)
+    /// has identical plan properties
+    same_props: usize,
+    /// new nodes whose children all have properties identical to the input
+    /// counterpart's children, and whose own properties are identical too
+    same_props_and_child_props: usize,
+    new_by_type: std::collections::BTreeMap<String, (usize, usize)>,
+}
+
+fn subtree_fps(
+    p: &Arc<dyn ExecutionPlan>,
+    out: &mut Vec<(Arc<dyn ExecutionPlan>, u64)>,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    displayable(p.as_ref()).one_line().to_string().hash(&mut h);
+    p.schema().hash(&mut h);
+    for c in p.children() {
+        subtree_fps(c, out).hash(&mut h);
+    }
+    let fp = h.finish();
+    out.push((Arc::clone(p), fp));
+    fp
+}
+
+fn rebuild_stats(
+    before: &Arc<dyn ExecutionPlan>,
+    after: &Arc<dyn ExecutionPlan>,
+) -> RebuildStats {
+    let (mut b, mut a) = (vec![], vec![]);
+    subtree_fps(before, &mut b);
+    subtree_fps(after, &mut a);
+    let ptrs: HashSet<*const ()> =
+        b.iter().map(|(p, _)| Arc::as_ptr(p) as *const ()).collect();
+    let fps: HashSet<u64> = b.iter().map(|(_, f)| *f).collect();
+    let key = |p: &Arc<dyn ExecutionPlan>| {
+        let mut h = DefaultHasher::new();
+        displayable(p.as_ref()).one_line().to_string().hash(&mut h);
+        p.schema().hash(&mut h);
+        h.finish()
+    };
+    let props = |p: &Arc<dyn ExecutionPlan>| {
+        format!(
+            "{} | {:?} | {:?} | {:?}",
+            p.equivalence_properties(),
+            p.output_partitioning(),
+            p.pipeline_behavior(),
+            p.boundedness()
+        )
+    };
+    let mut in_props: std::collections::HashMap<u64, Vec<(String, Vec<String>)>> =
+        Default::default();
+    for (p, _) in &b {
+        in_props
+            .entry(key(p))
+            .or_default()
+            .push((props(p), p.children().iter().map(|c| props(c)).collect()));
+    }
+    let mut st = RebuildStats {
+        nodes: a.len(),
+        ..Default::default()
+    };
+    for (p, f) in &a {
+        if !ptrs.contains(&(Arc::as_ptr(p) as *const ())) {
+            st.new_nodes += 1;
+            let needless = fps.contains(f);
+            let mine = props(p);
+            let kids: Vec<String> = p.children().iter().map(|c| props(c)).collect();
+            if let Some(cands) = in_props.get(&key(p)) {
+                if cands.iter().any(|(pp, _)| *pp == mine) {
+                    st.same_props += 1;
+                }
+                if cands.iter().any(|(pp, ck)| *pp == mine && *ck == kids) {
+                    st.same_props_and_child_props += 1;
+                }
+            }
+            st.needless += needless as usize;
+            let e = st.new_by_type.entry(p.name().to_string()).or_default();
+            e.0 += 1;
+            e.1 += needless as usize;
+        }
+    }
+    st
 }
 
 #[derive(Debug)]
@@ -96,11 +193,13 @@ impl PhysicalOptimizerRule for Recording {
         let dur = start.elapsed();
         let ptr_same = Arc::ptr_eq(&before, &out);
         let changed = !ptr_same && phys_string(&before) != phys_string(&out);
+        let rebuild = rebuild_stats(&before, &out);
         self.log.lock().unwrap().push(PhysRecord {
             name: self.inner.name().to_string(),
             dur,
             ptr_same,
             changed,
+            rebuild,
         });
         Ok(out)
     }
@@ -507,7 +606,11 @@ async fn main() -> Result<()> {
     let iters = args.iterations;
     let alias_re = regex::Regex::new(r"(__[a-z_]+?)_\d+").unwrap();
 
-    for q in 1..=22 {
+    let queries: Vec<usize> = match args.profile_query {
+        Some(q) => vec![q],
+        None => (1..=22).collect(),
+    };
+    for q in queries {
         let sql = std::fs::read_to_string(format!("{}/q{q}.sql", args.queries))?;
         let stmts: Vec<&str> = sql
             .split(';')
@@ -532,6 +635,21 @@ async fn main() -> Result<()> {
             state.config().options(),
             |_, _| {},
         )?;
+
+        if args.profile_query.is_some() {
+            let optimized = state.optimizer().optimize(analyzed, &state, |_, _| {})?;
+            for _ in 0..args.loops {
+                physical_from_optimized(&state, &optimized).await?;
+            }
+            if args.loops == 0 {
+                let p = physical_from_optimized(&state, &optimized).await?;
+                println!("{}", displayable(p.as_ref()).indent(false));
+            }
+            for s in &teardown {
+                ctx.sql(s).await?.collect().await?;
+            }
+            continue;
+        }
 
         // ---------- logical ----------
         let mut runs: Vec<Vec<LogRecord>> = vec![];
@@ -647,7 +765,11 @@ async fn main() -> Result<()> {
                 "{}",
                 json!({"q": q, "phase": "physical", "pass": 0, "rule": rec.name,
                        "ns": dur.as_nanos() as u64, "changed": rec.changed,
-                       "ptr_same": rec.ptr_same})
+                       "ptr_same": rec.ptr_same, "nodes": rec.rebuild.nodes,
+                       "new_nodes": rec.rebuild.new_nodes, "needless_new": rec.rebuild.needless,
+                       "same_props": rec.rebuild.same_props,
+                       "same_props_kids": rec.rebuild.same_props_and_child_props,
+                       "new_by_type": rec.rebuild.new_by_type})
             );
         }
 
@@ -672,6 +794,11 @@ async fn main() -> Result<()> {
         let full_p = physical_from_optimized(&state, &optimized).await?;
         let oracle_p = physical_from_optimized(&oracle_pstate, &optimized).await?;
         let physical_same = phys_string(&full_p) == phys_string(&oracle_p);
+        let plan_hash = {
+            let mut h = DefaultHasher::new();
+            phys_string(&full_p).hash(&mut h);
+            h.finish()
+        };
 
         println!(
             "{}",
@@ -683,6 +810,7 @@ async fn main() -> Result<()> {
                 "physical_oracle_ns": median(phys_oracle).as_nanos() as u64,
                 "physical_no_rules_ns": median(phys_none).as_nanos() as u64,
                 "physical_oracle_same_plan": physical_same,
+                "physical_plan_hash": plan_hash,
             })
         );
 
