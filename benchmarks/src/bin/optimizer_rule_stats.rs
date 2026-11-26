@@ -10,6 +10,8 @@
 //! followed by an "oracle" line per query that re-runs the optimizers with only
 //! the rules that changed something and reports the achieved time.
 
+use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -120,6 +122,161 @@ struct LogRecord {
     changed: bool,
     trigger: Option<bool>,
     trigger_dur: Duration,
+    /// CSE: some node repeats a non-trivial subexpression (or has a Window)
+    cse_dup: Option<bool>,
+    /// simplify_expressions: (nodes not seen in a previous simplify output, total nodes)
+    simp_dirty: Option<(usize, usize, usize, usize, usize)>,
+    prop_dur: Duration,
+}
+
+/// `common_sub_expression_eliminate` only rewrites a node if one of its
+/// non-ignored subexpressions occurs at least twice. Window nodes are CSEd
+/// together with adjacent windows, so they are reported as "might fire".
+fn cse_might_fire(plan: &LogicalPlan) -> bool {
+    use LogicalPlan as P;
+    any_node(plan, |n| match n {
+        P::Window(_) => true,
+        P::Projection(_) | P::Sort(_) | P::Filter(_) | P::Aggregate(_) => {
+            let mut seen = HashSet::new();
+            let mut dup = false;
+            let _ = n.apply_expressions(|e| {
+                e.apply(|x| {
+                    let ignored = matches!(
+                        x,
+                        Expr::Literal(..)
+                            | Expr::Column(..)
+                            | Expr::ScalarVariable(..)
+                            | Expr::Alias(..)
+                            | Expr::Lambda(_)
+                            | Expr::LambdaVariable(_)
+                            | Expr::WindowFunction(..)
+                    );
+                    // a hash collision only errs towards "might fire"
+                    let mut h = DefaultHasher::new();
+                    x.hash(&mut h);
+                    if !ignored && !seen.insert(h.finish()) {
+                        dup = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            });
+            dup
+        }
+        _ => false,
+    })
+}
+
+fn sorted_refs(e: &Expr) -> Vec<&Column> {
+    let mut v: Vec<_> = e.column_refs().into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Per expression: the expression, whether it sits in a Join (simplified without
+/// canonicalization) and the type/nullability of every column it references,
+/// which is all of the schema the simplifier can observe.
+fn simplify_expr_fingerprints(plan: &LogicalPlan) -> Vec<u64> {
+    let mut out = vec![];
+    let _ = plan.apply_with_subqueries(|n| {
+        let inputs = n.inputs();
+        let is_join = matches!(n, LogicalPlan::Join(_));
+        let _ = n.apply_expressions(|e| {
+            // nothing to simplify in a bare column/literal (possibly aliased)
+            let trivial = !e
+                .exists(|x| {
+                    Ok(!matches!(
+                        x,
+                        Expr::Column(_) | Expr::Literal(..) | Expr::Alias(_)
+                    ))
+                })
+                .unwrap();
+            if trivial {
+                return Ok(TreeNodeRecursion::Continue);
+            }
+            let mut h = DefaultHasher::new();
+            is_join.hash(&mut h);
+            e.hash(&mut h);
+            for c in sorted_refs(e) {
+                let field = inputs.iter().find_map(|i| {
+                    i.schema()
+                        .qualified_field_from_column(c)
+                        .ok()
+                        .map(|(_, f)| f)
+                });
+                match field {
+                    Some(f) => {
+                        f.data_type().hash(&mut h);
+                        f.is_nullable().hash(&mut h);
+                    }
+                    None => 0u8.hash(&mut h),
+                }
+            }
+            out.push(h.finish());
+            Ok(TreeNodeRecursion::Continue)
+        });
+        Ok(TreeNodeRecursion::Continue)
+    });
+    out
+}
+
+/// Fingerprints of every subexpression of every expression (same key as
+/// `simplify_expr_fingerprints`).
+fn simplify_subexpr_fingerprints(plan: &LogicalPlan) -> Vec<u64> {
+    let mut out = vec![];
+    let _ = plan.apply_with_subqueries(|n| {
+        let inputs = n.inputs();
+        let is_join = matches!(n, LogicalPlan::Join(_));
+        let _ = n.apply_expressions(|e| {
+            e.apply(|x| {
+                let mut h = DefaultHasher::new();
+                is_join.hash(&mut h);
+                x.hash(&mut h);
+                for c in sorted_refs(x) {
+                    let field = inputs.iter().find_map(|i| {
+                        i.schema()
+                            .qualified_field_from_column(c)
+                            .ok()
+                            .map(|(_, f)| f)
+                    });
+                    match field {
+                        Some(f) => {
+                            f.data_type().hash(&mut h);
+                            f.is_nullable().hash(&mut h);
+                        }
+                        None => 0u8.hash(&mut h),
+                    }
+                }
+                out.push(h.finish());
+                Ok(TreeNodeRecursion::Continue)
+            })
+        });
+        Ok(TreeNodeRecursion::Continue)
+    });
+    out
+}
+
+/// What `simplify_expressions` looks at for one node: the node kind, its
+/// expressions and its input schemas.
+fn simplify_fingerprints(plan: &LogicalPlan) -> Vec<u64> {
+    let mut out = vec![];
+    let _ = plan.apply_with_subqueries(|n| {
+        let mut h = DefaultHasher::new();
+        std::mem::discriminant(n).hash(&mut h);
+        let _ = n.apply_expressions(|e| {
+            e.hash(&mut h);
+            Ok(TreeNodeRecursion::Continue)
+        });
+        for i in n.inputs() {
+            i.schema().hash(&mut h);
+        }
+        if let LogicalPlan::TableScan(t) = n {
+            t.table_name.hash(&mut h);
+        }
+        out.push(h.finish());
+        Ok(TreeNodeRecursion::Continue)
+    });
+    out
 }
 
 fn any_node(plan: &LogicalPlan, f: impl Fn(&LogicalPlan) -> bool) -> bool {
@@ -244,6 +401,9 @@ fn observe_logical(state: &SessionState, plan: &LogicalPlan) -> Result<Vec<LogRe
     let mut prev = plan.clone();
     let mut records = vec![];
     let mut idx = 0usize;
+    let mut simplified: HashSet<u64> = HashSet::new();
+    let mut simplified_exprs: HashSet<u64> = HashSet::new();
+    let mut simplified_sub: HashSet<u64> = HashSet::new();
     let mut last_end = Instant::now();
     state
         .optimizer()
@@ -252,7 +412,30 @@ fn observe_logical(state: &SessionState, plan: &LogicalPlan) -> Result<Vec<LogRe
             let t = Instant::now();
             let trig = trigger(rule.name(), &prev);
             let trigger_dur = t.elapsed();
+            let t = Instant::now();
+            let (cse_dup, simp_dirty) = match rule.name() {
+                "common_sub_expression_eliminate" => (Some(cse_might_fire(&prev)), None),
+                "simplify_expressions" if !simplified.is_empty() => {
+                    let fps = simplify_fingerprints(&prev);
+                    let dirty = fps.iter().filter(|f| !simplified.contains(f)).count();
+                    let efps = simplify_expr_fingerprints(&prev);
+                    let edirty = efps
+                        .iter()
+                        .filter(|f| !simplified_exprs.contains(f))
+                        .count();
+                    let sdirty =
+                        efps.iter().filter(|f| !simplified_sub.contains(f)).count();
+                    (None, Some((dirty, fps.len(), edirty, efps.len(), sdirty)))
+                }
+                _ => (None, None),
+            };
+            let prop_dur = t.elapsed();
             let changed = *new != prev;
+            if rule.name() == "simplify_expressions" {
+                simplified.extend(simplify_fingerprints(new));
+                simplified_exprs.extend(simplify_expr_fingerprints(new));
+                simplified_sub.extend(simplify_subexpr_fingerprints(new));
+            }
             if changed {
                 prev = new.clone();
             }
@@ -263,6 +446,9 @@ fn observe_logical(state: &SessionState, plan: &LogicalPlan) -> Result<Vec<LogRe
                 changed,
                 trigger: trig,
                 trigger_dur,
+                cse_dup,
+                simp_dirty,
+                prop_dur,
             });
             idx += 1;
             last_end = Instant::now();
@@ -362,6 +548,7 @@ async fn main() -> Result<()> {
             let rec = &runs[0][i];
             let dur = median(runs.iter().map(|r| r[i].dur).collect());
             let trig_dur = median(runs.iter().map(|r| r[i].trigger_dur).collect());
+            let prop_dur = median(runs.iter().map(|r| r[i].prop_dur).collect());
             if rec.changed {
                 changed_rules.push(Arc::clone(&all_rules[i % all_rules.len()]));
             }
@@ -369,7 +556,9 @@ async fn main() -> Result<()> {
                 "{}",
                 json!({"q": q, "phase": "logical", "pass": rec.pass, "rule": rec.name,
                        "ns": dur.as_nanos() as u64, "changed": rec.changed,
-                       "trigger": rec.trigger, "trigger_ns": trig_dur.as_nanos() as u64})
+                       "trigger": rec.trigger, "trigger_ns": trig_dur.as_nanos() as u64,
+                       "cse_dup": rec.cse_dup, "simp_dirty": rec.simp_dirty,
+                       "prop_ns": prop_dur.as_nanos() as u64})
             );
         }
 
