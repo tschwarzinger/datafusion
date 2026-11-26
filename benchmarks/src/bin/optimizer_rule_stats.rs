@@ -53,6 +53,29 @@ struct Args {
     profile_query: Option<usize>,
     #[arg(long, default_value_t = 100)]
     loops: usize,
+    /// Time the whole planning pipeline per query (SQL -> physical plan)
+    #[arg(long)]
+    e2e: bool,
+}
+
+/// SQL text to optimized physical plan, timing each stage.
+#[inline(never)]
+async fn plan_once(state: &SessionState, sql: &str) -> Result<[Duration; 4]> {
+    let t = Instant::now();
+    let raw = state.create_logical_plan(sql).await?;
+    let t_sql = t.elapsed();
+    let t = Instant::now();
+    let analyzed =
+        state
+            .analyzer()
+            .execute_and_check(raw, state.config().options(), |_, _| {})?;
+    let t_an = t.elapsed();
+    let t = Instant::now();
+    let optimized = state.optimizer().optimize(analyzed, state, |_, _| {})?;
+    let t_opt = t.elapsed();
+    let t = Instant::now();
+    std::hint::black_box(physical_from_optimized(state, &optimized).await?);
+    Ok([t_sql, t_an, t_opt, t.elapsed()])
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -626,6 +649,26 @@ async fn main() -> Result<()> {
             };
         for s in &setup {
             ctx.sql(s).await?.collect().await?;
+        }
+        if args.e2e {
+            let state = ctx.state();
+            let mut runs = vec![];
+            for _ in 0..args.iterations {
+                runs.push(plan_once(&state, main_sql).await?);
+            }
+            let med =
+                |i: usize| median(runs.iter().map(|r| r[i]).collect()).as_nanos() as u64;
+            let total =
+                median(runs.iter().map(|r| r.iter().sum()).collect()).as_nanos() as u64;
+            println!(
+                "{}",
+                json!({"q": q, "phase": "e2e", "sql_ns": med(0), "analyzer_ns": med(1),
+                       "optimizer_ns": med(2), "physical_ns": med(3), "total_ns": total})
+            );
+            for s in &teardown {
+                ctx.sql(s).await?.collect().await?;
+            }
+            continue;
         }
 
         let state = ctx.state();
