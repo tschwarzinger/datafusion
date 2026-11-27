@@ -376,7 +376,7 @@ mod tests {
         convert_to_sort_reqs, create_test_params, create_test_schema, parse_sort_expr,
     };
     use crate::equivalence::{ProjectionMapping, convert_to_sort_exprs};
-    use crate::expressions::{BinaryExpr, CastExpr, Column, col};
+    use crate::expressions::{BinaryExpr, CastExpr, Column, col, lit};
     use crate::projection::tests::output_schema;
     use crate::{ConstExpr, EquivalenceProperties, ScalarFunctionExpr};
 
@@ -384,7 +384,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::config::ConfigOptions;
-    use datafusion_common::{Constraint, Constraints, Result};
+    use datafusion_common::{Constraint, Constraints, Result, ScalarValue};
     use datafusion_expr::ColumnarValue;
     use datafusion_expr::Operator;
     use datafusion_expr::interval_arithmetic::Interval;
@@ -699,6 +699,59 @@ mod tests {
             assert_eq!(expr_props.sort_properties, expected, "{err_msg}");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_type_properties() -> Result<()> {
+        let term_type = DataType::Struct(Fields::from(vec![
+            Field::new("term_type", DataType::UInt8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", term_type.clone(), true),
+            Field::new("o", term_type.clone(), true),
+        ]));
+        let col_s = col("s", &schema)?;
+        let col_o = col("o", &schema)?;
+        let asc = SortOptions::default();
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
+        eq_properties.add_ordering([
+            PhysicalSortExpr::new(Arc::clone(&col_s), asc),
+            PhysicalSortExpr::new(Arc::clone(&col_o), asc),
+        ]);
+        let struct_lit = lit(ScalarValue::try_from(&term_type)?);
+
+        let test_cases: Vec<(Arc<dyn PhysicalExpr>, SortProperties)> = vec![
+            (Arc::clone(&col_s), SortProperties::Ordered(asc)),
+            (Arc::clone(&col_o), SortProperties::Unordered),
+            (
+                Arc::new(BinaryExpr::new(
+                    Arc::clone(&col_s),
+                    Operator::Gt,
+                    struct_lit,
+                )),
+                SortProperties::Ordered(asc),
+            ),
+        ];
+        for (expr, expected) in test_cases {
+            let properties = eq_properties.get_expr_properties(Arc::clone(&expr));
+            assert_eq!(properties.sort_properties, expected, "{expr}");
+        }
+        // Nested types get the placeholder range:
+        let properties = eq_properties.get_expr_properties(Arc::clone(&col_s));
+        assert_eq!(properties.range.data_type(), DataType::Null);
+
+        let mapping = ProjectionMapping::try_new(
+            [(col_o, "o1".to_string()), (col_s, "s1".to_string())],
+            &schema,
+        )?;
+        let projected =
+            eq_properties.project(&mapping, output_schema(&mapping, &schema)?);
+        assert_eq!(
+            projected.oeq_class().to_string(),
+            "[[s1@1 ASC NULLS FIRST, o1@0 ASC NULLS FIRST]]"
+        );
         Ok(())
     }
 
@@ -1762,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn project_builds_the_range_of_an_ordered_column_once() -> Result<()> {
+    fn project_gives_an_ordered_struct_column_a_placeholder_range() -> Result<()> {
         let fields = Fields::from(vec![
             Field::new("x", DataType::Int64, true),
             Field::new("y", DataType::Utf8, true),
@@ -1791,19 +1844,17 @@ mod tests {
             sorted_orderings(&projected),
             vec!["p0@0 ASC", "p1@1 ASC", "p2@2 ASC"]
         );
-        // A rebuilt range of a struct holds a new null array.
-        let mut arrays = vec![];
+        // The range of a struct is a placeholder, which holds no null array
+        // of the struct.
+        let mut ranges = 0;
         for seen in &seen {
             for range in seen.lock().unwrap().iter() {
-                let datafusion_common::ScalarValue::Struct(array) = range.lower() else {
-                    panic!("{range:?}");
-                };
-                arrays.push(Arc::clone(array));
+                assert_eq!(range.data_type(), DataType::Null, "{range:?}");
+                ranges += 1;
             }
         }
         // Each probe is examined by both steps.
-        assert!(arrays.len() >= 6, "{}", arrays.len());
-        assert!(arrays.iter().all(|a| Arc::ptr_eq(a, &arrays[0])));
+        assert!(ranges >= 6, "{ranges}");
         Ok(())
     }
 

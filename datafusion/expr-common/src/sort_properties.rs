@@ -473,6 +473,10 @@ pub struct ExprProperties {
     pub sort_properties: SortProperties,
     /// A closed interval representing the range of possible values for
     /// the expression. Used to compute reliable bounds.
+    ///
+    /// Interval arithmetic does not support nested types, such as structs,
+    /// lists and maps. The range of an expression of such a type is the
+    /// unbounded interval of [`DataType::Null`], as for [`Self::new_unknown`].
     pub range: Interval,
     /// Indicates whether the expression preserves lexicographical ordering
     /// of its inputs.

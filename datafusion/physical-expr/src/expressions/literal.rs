@@ -7,6 +7,7 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::intervals::utils::unbounded_range;
 use crate::physical_expr::PhysicalExpr;
 
 use arrow::datatypes::{Field, FieldRef, Metadata};
@@ -113,7 +114,10 @@ impl PhysicalExpr for Literal {
     fn get_properties(&self, _children: &[ExprProperties]) -> Result<ExprProperties> {
         Ok(ExprProperties {
             sort_properties: SortProperties::Singleton,
-            range: Interval::try_new(self.value().clone(), self.value().clone())?,
+            range: match self.value().data_type() {
+                data_type if data_type.is_nested() => unbounded_range(&data_type)?,
+                _ => Interval::try_new(self.value().clone(), self.value().clone())?,
+            },
             preserves_lex_ordering: true,
             // Vacuously true: a literal has no ordered inputs.
             strictly_order_preserving: true,

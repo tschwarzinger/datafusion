@@ -151,6 +151,19 @@ fn create_struct_table_provider() -> Arc<MemTable> {
         .unwrap()
 }
 
+/// Create a table provider with columns `s`, `p` and `o` of type `term_type`,
+/// modeled on a triple table of an RDF store
+fn create_triple_table_provider(term_type: &DataType) -> Arc<MemTable> {
+    let schema = Arc::new(Schema::new(
+        ["s", "p", "o"]
+            .map(|name| Field::new(name, term_type.clone(), true))
+            .to_vec(),
+    ));
+    MemTable::try_new(schema, vec![vec![]])
+        .map(Arc::new)
+        .unwrap()
+}
+
 fn create_context() -> SessionContext {
     let ctx = SessionContext::new();
     ctx.register_table("t1", create_table_provider("a", 200))
@@ -165,6 +178,19 @@ fn create_context() -> SessionContext {
         .unwrap();
     ctx.register_table("struct_t2", create_struct_table_provider())
         .unwrap();
+    let term_struct = DataType::Struct(Fields::from(vec![
+        Field::new("term_type", DataType::UInt8, false),
+        Field::new("value", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, true),
+        Field::new("language_tag", DataType::Utf8, true),
+    ]));
+    ctx.register_table("triples_struct", create_triple_table_provider(&term_struct))
+        .unwrap();
+    ctx.register_table(
+        "triples_uint64",
+        create_triple_table_provider(&DataType::UInt64),
+    )
+    .unwrap();
     ctx
 }
 
@@ -566,6 +592,26 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("physical_plan_struct_join_agg_sort", |b| {
         b.iter(|| physical_plan(&ctx, &rt, struct_agg_sort_query))
     });
+
+    // -- Triple table benchmarks --
+    // A star and a chain of triple patterns joined on their subjects and
+    // objects, as an RDF store plans a SPARQL basic graph pattern. The terms
+    // are 4-field structs or dictionary-encoded `UInt64` ids.
+    for encoding in ["struct", "uint64"] {
+        let query = format!(
+            "SELECT t1.s, t2.o, t3.o, t4.o, t5.o, t6.o \
+             FROM triples_{encoding} t1 \
+             JOIN triples_{encoding} t2 ON t1.s = t2.s \
+             JOIN triples_{encoding} t3 ON t1.s = t3.s \
+             JOIN triples_{encoding} t4 ON t1.s = t4.s \
+             JOIN triples_{encoding} t5 ON t4.o = t5.s \
+             JOIN triples_{encoding} t6 ON t5.o = t6.s \
+             WHERE t1.p = t2.p AND t3.o <> t2.o"
+        );
+        c.bench_function(&format!("physical_plan_triples_{encoding}_join"), |b| {
+            b.iter(|| physical_plan(&ctx, &rt, &query))
+        });
+    }
 
     // -- Sorted Queries --
     // 100, 200 && 300 is taking too long - https://github.com/apache/datafusion/issues/18366

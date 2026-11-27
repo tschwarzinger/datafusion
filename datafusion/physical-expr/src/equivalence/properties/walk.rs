@@ -7,12 +7,12 @@ use std::sync::Arc;
 use super::EquivalenceProperties;
 use crate::equivalence::ordering::is_partial_const;
 use crate::expressions::{Column, Literal};
+use crate::intervals::utils::unbounded_range;
 use crate::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 
 use arrow::compute::SortOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{HashSet, Result};
-use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::sort_expr::options_compatible;
 use datafusion_physical_expr_common::utils::ExprPropertiesNode;
@@ -354,7 +354,7 @@ impl<'a> SortKeyWalk<'a> {
             // do not fail here, and keep the type of its range so that parents
             // can derive from it.
             node.data = node.expr.get_properties(&children_props).or_else(|_| {
-                Interval::make_unbounded(&node.expr.data_type(self.props.schema())?)
+                unbounded_range(&node.expr.data_type(self.props.schema())?)
                     .map(|range| ExprProperties::new_unknown().with_range(range))
             })?;
         } else if node.expr.is::<Literal>() {
@@ -363,7 +363,7 @@ impl<'a> SortKeyWalk<'a> {
         } else if node.expr.is::<Column>() {
             // We have a Column, which is the other possible leaf node type:
             node.data.range =
-                Interval::make_unbounded(&node.expr.data_type(self.props.schema())?)?;
+                unbounded_range(&node.expr.data_type(self.props.schema())?)?;
             // A column is the identity mapping of itself, which is trivially
             // strict:
             node.data.strictly_order_preserving = true;

@@ -25,6 +25,7 @@ use crate::equivalence::{
     OrderingEquivalenceClass, ProjectionMapping,
 };
 use crate::expressions::{Column, Literal, with_new_schema};
+use crate::intervals::utils::unbounded_range;
 use crate::{
     ConstExpr, LexOrdering, LexRequirement, PhysicalExpr, PhysicalSortExpr,
     PhysicalSortRequirement,
@@ -949,7 +950,7 @@ impl EquivalenceProperties {
                         let data_type = arg.data_type(&self.schema)?;
                         arg_properties.push(ExprProperties {
                             sort_properties: SortProperties::Ordered(sort_expr.options),
-                            range: Interval::make_unbounded(&data_type)?,
+                            range: unbounded_range(&data_type)?,
                             preserves_lex_ordering: true,
                             strictly_order_preserving: true,
                         });
@@ -2036,11 +2037,8 @@ fn expr_refers(
 
 /// Unbounded ranges of the columns of one schema, built on first use.
 ///
-/// Building the unbounded range of a nested type materializes a null array of that type, so
-/// a wide struct referenced by many projection sources is costly to rebuild per reference.
 /// Only `Column`s are cached, by index: the schema is fixed for the cache's lifetime. Other
-/// expressions and failures are computed as before and never cached. Cloning a cached range
-/// clones its two endpoints, which for nested types share their arrays.
+/// expressions and failures are computed as before and never cached.
 #[derive(Default)]
 struct ColumnRanges(std::cell::RefCell<HashMap<usize, Interval>>);
 
@@ -2051,12 +2049,12 @@ impl ColumnRanges {
         schema: &SchemaRef,
     ) -> Result<Interval> {
         let Some(column) = expr.downcast_ref::<Column>() else {
-            return Interval::make_unbounded(&expr.data_type(schema)?);
+            return unbounded_range(&expr.data_type(schema)?);
         };
         if let Some(range) = self.0.borrow().get(&column.index()) {
             return Ok(range.clone());
         }
-        let range = Interval::make_unbounded(&expr.data_type(schema)?)?;
+        let range = unbounded_range(&expr.data_type(schema)?)?;
         self.0.borrow_mut().insert(column.index(), range.clone());
         Ok(range)
     }
@@ -2110,7 +2108,10 @@ fn get_expr_properties(
     } else if let Some(literal) = expr.downcast_ref::<Literal>() {
         Ok(ExprProperties {
             sort_properties: SortProperties::Singleton,
-            range: literal.value().into(),
+            range: match literal.value().data_type() {
+                data_type if data_type.is_nested() => unbounded_range(&data_type)?,
+                _ => literal.value().into(),
+            },
             preserves_lex_ordering: true,
             // Vacuously true: a literal has no ordered inputs.
             strictly_order_preserving: true,

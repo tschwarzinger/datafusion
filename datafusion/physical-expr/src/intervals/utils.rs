@@ -167,6 +167,26 @@ pub fn is_datatype_supported(data_type: &DataType) -> bool {
     )
 }
 
+/// Returns the unbounded range that ordering analysis assigns to an expression
+/// of `data_type`.
+///
+/// Interval arithmetic does not support nested types, so their ranges carry no
+/// information. Building one materializes a null array of the type, including
+/// all of its children, for every column of every plan node built.
+/// Nested types therefore get the same `Null`-typed range as
+/// [`ExprProperties::new_unknown`]. Literals of nested types must get this
+/// range too, as comparing ranges of different types fails, which would drop
+/// the ordering of `nested_column > nested_literal`.
+///
+/// [`ExprProperties::new_unknown`]: datafusion_expr::sort_properties::ExprProperties::new_unknown
+pub(crate) fn unbounded_range(data_type: &DataType) -> Result<Interval> {
+    if data_type.is_nested() {
+        Interval::make_unbounded(&DataType::Null)
+    } else {
+        Interval::make_unbounded(data_type)
+    }
+}
+
 /// Converts an [`Interval`] of time intervals to one of `Duration`s, if applicable. Otherwise, returns [`None`].
 pub fn convert_interval_type_to_duration(interval: &Interval) -> Option<Interval> {
     if let (Some(lower), Some(upper)) = (
